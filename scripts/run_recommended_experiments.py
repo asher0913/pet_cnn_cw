@@ -63,6 +63,8 @@ code deliverable.
 from __future__ import annotations
 
 import argparse
+import os
+import shlex
 import subprocess
 import sys
 import time
@@ -73,6 +75,24 @@ from pathlib import Path
 # the repo root or from anywhere else, as long as ``pet_cw`` is
 # importable in the current environment.
 TRAIN_MODULE = "pet_cw.train"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+
+
+def project_path(path: str) -> str:
+    """Resolve relative paths against the project root, not the caller's cwd."""
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+    return str((PROJECT_ROOT / candidate).resolve())
+
+
+def subprocess_env() -> dict[str, str]:
+    """Make the src-layout package importable even before pip install -e ."""
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(SRC_DIR) if not existing else f"{SRC_DIR}{os.pathsep}{existing}"
+    return env
 
 
 def build_experiments(data_dir: str, output_dir: str, num_workers: int) -> list[dict]:
@@ -199,19 +219,23 @@ def parse_args() -> argparse.Namespace:
 
 def format_command(args: list[str]) -> str:
     """Pretty-print a command for logging."""
-    return " ".join([sys.executable, "-m", TRAIN_MODULE, *args])
+    command = [sys.executable, "-m", TRAIN_MODULE, *args]
+    command_text = " ".join(shlex.quote(part) for part in command)
+    return f"cd {shlex.quote(str(PROJECT_ROOT))} && PYTHONPATH={shlex.quote(str(SRC_DIR))} {command_text}"
 
 
 def run_single_experiment(args: list[str]) -> int:
     """Launch one training run. Return its exit code."""
     command = [sys.executable, "-m", TRAIN_MODULE, *args]
     # Inherit stdout/stderr so tqdm bars and log lines stream live.
-    process = subprocess.run(command, check=False)
+    process = subprocess.run(command, check=False, cwd=PROJECT_ROOT, env=subprocess_env())
     return process.returncode
 
 
 def main() -> None:
     cli = parse_args()
+    cli.data_dir = project_path(cli.data_dir)
+    cli.output_dir = project_path(cli.output_dir)
 
     Path(cli.output_dir).mkdir(parents=True, exist_ok=True)
 
