@@ -23,13 +23,21 @@ What happens in one run:
 from __future__ import annotations
 
 import argparse
+import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, StepLR
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    ReduceLROnPlateau,
+    SequentialLR,
+    StepLR,
+)
 from tqdm import tqdm
 
 from pet_cw.data import build_dataloaders
@@ -63,8 +71,11 @@ def parse_args() -> argparse.Namespace:
     # --- Model ---
     parser.add_argument("--model", default="custom", choices=MODEL_CHOICES,
                         help="Model architecture to train.")
+    # Default is False so that the run-config.json saved by a Task 2
+    # run cannot be mistaken for a pretrained-weights run. Transfer
+    # experiments must pass ``--pretrained`` explicitly.
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction,
-                        default=True,
+                        default=False,
                         help="Use ImageNet weights for transfer models. Ignored for custom.")
     parser.add_argument("--freeze-backbone", action="store_true",
                         help="Freeze the pretrained feature extractor (feature-extraction strategy).")
@@ -93,8 +104,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler",
                         choices=["none", "step", "cosine", "plateau"],
                         default="none")
+    parser.add_argument("--warmup-epochs", type=int, default=0,
+                        help="Linear LR warmup for the first N epochs. Only combines with cosine; "
+                             "ignored for other schedulers. 0 disables warmup.")
     parser.add_argument("--label-smoothing", type=float, default=0.0,
                         help="Cross-entropy label smoothing factor. 0.1 is a reasonable starting point.")
+    parser.add_argument("--mixup-alpha", type=float, default=0.0,
+                        help="Beta distribution parameter for Mixup. 0 disables Mixup; 0.2 is typical.")
     parser.add_argument("--grad-clip", type=float, default=0.0,
                         help="Max grad norm. 0 disables clipping.")
     parser.add_argument("--head-lr-mult", type=float, default=10.0,
@@ -149,17 +165,65 @@ def build_optimizer(args: argparse.Namespace, model: nn.Module) -> Optimizer:
 
 
 def build_scheduler(args: argparse.Namespace, optimizer: Optimizer):
-    """Map the CLI choice to a torch.optim.lr_scheduler object."""
+    """Map the CLI choice to a torch.optim.lr_scheduler object.
+
+    Cosine annealing optionally gets a short linear warmup wrapped
+    around it via ``SequentialLR``. Warmup helps when training from
+    scratch because BatchNorm statistics are still garbage for the
+    first few iterations and a full learning rate can make the first
+    epoch diverge. For transfer learning with pretrained weights the
+    warmup is less important but does not hurt.
+    """
     if args.scheduler == "none":
         return None
     if args.scheduler == "step":
         # One step-down at 1/3 of training, another at 2/3.
         return StepLR(optimizer, step_size=max(1, args.epochs // 3), gamma=0.1)
     if args.scheduler == "cosine":
-        return CosineAnnealingLR(optimizer, T_max=args.epochs)
+        warmup = max(int(args.warmup_epochs), 0)
+        cosine_epochs = max(args.epochs - warmup, 1)
+        cosine = CosineAnnealingLR(optimizer, T_max=cosine_epochs)
+        if warmup == 0:
+            return cosine
+        # Start at start_factor * base_lr and linearly ramp to base_lr
+        # by the end of the warmup window. 0.1 is a standard choice.
+        warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup)
+        return SequentialLR(optimizer, schedulers=[warmup_sched, cosine], milestones=[warmup])
     if args.scheduler == "plateau":
         return ReduceLROnPlateau(optimizer, mode="min", patience=2, factor=0.5)
     raise ValueError(f"Unknown scheduler: {args.scheduler}")
+
+
+def mixup_batch(
+    images: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Return (mixed_images, targets_a, targets_b, lam).
+
+    Mixup (Zhang et al., 2018) builds a virtual training example by
+    convex-combining two real images and their labels::
+
+        x_mix = lam * x_a + (1 - lam) * x_b
+        y_mix = lam * y_a + (1 - lam) * y_b
+
+    Because PyTorch's ``CrossEntropyLoss`` expects integer targets,
+    the combined loss is computed in the training loop as
+    ``lam * loss_a + (1 - lam) * loss_b`` instead of mixing labels
+    directly, which is numerically identical for cross-entropy.
+
+    ``lam`` is drawn from a Beta(alpha, alpha) distribution; small
+    alpha concentrates mass near 0 or 1 (little mixing), large alpha
+    concentrates mass near 0.5 (heavy mixing). 0.2 works well here.
+    """
+    if alpha <= 0.0:
+        # Defensive: caller should check, but this keeps the function safe.
+        return images, targets, targets, 1.0
+
+    lam = float(np.random.beta(alpha, alpha))
+    permutation = torch.randperm(images.size(0), device=images.device)
+    mixed = lam * images + (1.0 - lam) * images[permutation]
+    return mixed, targets, targets[permutation], lam
 
 
 def unwrap_compiled(model: nn.Module) -> nn.Module:
@@ -183,14 +247,23 @@ def run_one_epoch(
     grad_clip: float,
     epoch: int,
     phase: str,
+    mixup_alpha: float = 0.0,
 ) -> tuple[float, float, list[int], list[int]]:
     """Run one pass over ``loader`` in either train or eval mode.
 
     ``optimizer=None`` means evaluation-only: no grads, no weight
     update. The same function is used from evaluate.py to score a
     checkpoint.
+
+    When ``mixup_alpha > 0`` and ``optimizer is not None``, Mixup is
+    applied to each training batch. Validation and test phases never
+    see Mixup, so their numbers stay directly comparable across runs.
+    Training accuracy in Mixup mode is reported against the primary
+    target of each mixed pair; the number is a bit noisier than
+    plain training accuracy but still tracks model progress.
     """
     is_train = optimizer is not None
+    use_mixup = is_train and mixup_alpha > 0.0
     model.train(mode=is_train)
 
     loss_meter = AverageMeter()
@@ -208,12 +281,25 @@ def run_one_epoch(
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
+        # Apply Mixup before the forward pass. Do this outside autocast
+        # so the interpolation happens in fp32 and does not introduce
+        # rounding noise on top of the mixing.
+        if use_mixup:
+            mixed_images, targets_a, targets_b, lam = mixup_batch(images, targets, mixup_alpha)
+        else:
+            mixed_images, targets_a, targets_b, lam = images, targets, targets, 1.0
+
         with torch.set_grad_enabled(is_train):
             # New torch.amp API (PyTorch 2.1+). Works on CPU too, it just
             # becomes a no-op when use_amp is False.
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                logits = model(images)
-                loss = criterion(logits, targets)
+                logits = model(mixed_images)
+                if use_mixup:
+                    # Cross-entropy is linear in the one-hot target, so
+                    # mixing the losses is identical to mixing the labels.
+                    loss = lam * criterion(logits, targets_a) + (1.0 - lam) * criterion(logits, targets_b)
+                else:
+                    loss = criterion(logits, targets_a)
 
             if is_train:
                 if scaler is not None and use_amp:
@@ -334,13 +420,18 @@ def main() -> None:
     best_path = run_dir / "best_model.pt"
     last_path = run_dir / "last_model.pt"
 
+    # Wall-clock timing so the report can quote training cost per model.
+    training_start = time.time()
+
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
         train_loss, train_acc, _, _ = run_one_epoch(
             model=model, loader=data.train_loader,
             criterion=criterion, optimizer=optimizer,
             device=device, scaler=scaler, use_amp=use_amp,
             grad_clip=args.grad_clip,
             epoch=epoch, phase="train",
+            mixup_alpha=args.mixup_alpha,
         )
 
         with torch.no_grad():
@@ -351,6 +442,7 @@ def main() -> None:
                 grad_clip=0.0,
                 epoch=epoch, phase="val",
             )
+        epoch_seconds = time.time() - epoch_start
 
         # Plateau scheduler needs a metric. Others just step per epoch.
         if scheduler is not None:
@@ -367,6 +459,7 @@ def main() -> None:
             "val_loss": float(val_loss),
             "val_acc": float(val_acc),
             "lr": float(current_lr),
+            "epoch_seconds": float(epoch_seconds),
         }
         history.append(row)
         write_history_csv(run_dir / "history.csv", history)
@@ -395,7 +488,13 @@ def main() -> None:
 
         print(f"Epoch {epoch:03d}/{args.epochs:03d}  "
               f"train_loss={train_loss:.4f} train_acc={train_acc:.4f}  "
-              f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}  lr={current_lr:.6f}")
+              f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}  "
+              f"lr={current_lr:.6f}  time={epoch_seconds:.1f}s")
+
+    total_training_seconds = time.time() - training_start
+    mean_epoch_seconds = (
+        sum(row["epoch_seconds"] for row in history) / len(history) if history else 0.0
+    )
 
     # Optional final evaluation on the untouched test split.
     # The best checkpoint is always restored first so numbers match
@@ -418,9 +517,30 @@ def main() -> None:
                                     data.class_names, prefix="test")
         print(f"Test loss={test_loss:.4f}  test_acc={test_acc:.4f}")
 
+    # summary.json collects every number the report is likely to cite,
+    # so the aggregation script does not have to re-open each history.csv.
     summary = {
-        "best_val_acc": best_val_acc,
+        "experiment_name": args.experiment_name,
+        "model": args.model,
+        "pretrained": bool(args.pretrained and args.model != "custom"),
+        "freeze_backbone": bool(args.freeze_backbone and args.model != "custom"),
+        "image_size": args.image_size,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "optimizer": args.optimizer,
+        "learning_rate": args.lr,
+        "scheduler": args.scheduler,
+        "warmup_epochs": args.warmup_epochs,
+        "weight_decay": args.weight_decay,
+        "label_smoothing": args.label_smoothing,
+        "mixup_alpha": args.mixup_alpha,
+        "augmentation": args.augmentation,
+        "total_parameters": total_params,
+        "trainable_parameters": trainable_params,
+        "best_val_acc": float(best_val_acc),
         "best_model": str(best_path),
+        "mean_epoch_seconds": float(mean_epoch_seconds),
+        "total_training_seconds": float(total_training_seconds),
     }
     if test_acc is not None:
         summary["test_acc"] = float(test_acc)
@@ -429,6 +549,8 @@ def main() -> None:
     print(f"\nDone. Best validation accuracy: {best_val_acc:.4f}")
     if test_acc is not None:
         print(f"Test accuracy (held-out split): {test_acc:.4f}")
+    print(f"Mean epoch time: {mean_epoch_seconds:.1f}s  "
+          f"(total training: {total_training_seconds/60:.1f} min)")
     print(f"All artifacts saved in: {run_dir}")
 
 

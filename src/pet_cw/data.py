@@ -110,14 +110,19 @@ def build_transforms(image_size: int, augmentation: str) -> tuple[transforms.Com
         ]
 
     elif augmentation == "strong":
-        # RandomResizedCrop gives the biggest boost because pet photos
-        # have very different framings. The scale range is kept tight
-        # to reduce the chance of cropping out the animal entirely.
+        # RandomResizedCrop handles the varying framings of pet photos.
+        # The scale range is kept fairly tight so the animal is almost
+        # always still inside the crop. TrivialAugmentWide then applies
+        # one further random op (rotation, shear, colour, posterise,
+        # etc.) per sample, which is the strongest standard recipe
+        # that does not need hyperparameter tuning; it is the default
+        # the torchvision reference scripts use for modern training
+        # from scratch. RandomErasing at the very end occludes a small
+        # rectangle in normalised space, acting as a cheap Cutout.
         train_steps = [
             transforms.RandomResizedCrop(image_size, scale=(0.7, 1.0), ratio=(0.80, 1.25)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.04),
+            transforms.TrivialAugmentWide(),
         ]
 
     else:
@@ -131,7 +136,7 @@ def build_transforms(image_size: int, augmentation: str) -> tuple[transforms.Com
     # RandomErasing goes after Normalize, otherwise the zero-valued
     # erased patch becomes a non-zero value in normalised space.
     if augmentation == "strong":
-        train_steps.append(transforms.RandomErasing(p=0.15, scale=(0.02, 0.12), ratio=(0.3, 3.3)))
+        train_steps.append(transforms.RandomErasing(p=0.1, scale=(0.02, 0.12), ratio=(0.3, 3.3)))
 
     eval_steps = [
         transforms.Resize((image_size, image_size)),

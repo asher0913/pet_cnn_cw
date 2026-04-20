@@ -74,7 +74,8 @@ the CUDA build that matches the installed driver.
 
 The recommended script passes `--download`, so torchvision will try
 to fetch Oxford-IIIT Pet automatically. If the GPU server has no
-internet access or DNS, you will see an error like:
+internet access or DNS, the training process will raise an error
+of the form:
 
 ```text
 Temporary failure in name resolution
@@ -165,87 +166,106 @@ A run named `foo` creates `outputs/foo_<timestamp>/` with:
 Test-set artifacts only appear if the run used `--test-at-end`,
 which the recommended driver does for every experiment.
 
+Once every run in the sweep has finished, the driver also writes
+two project-level summary files:
+
+| File                                | What it is                                           |
+| ----------------------------------- | ---------------------------------------------------- |
+| `outputs/ablation_summary.csv`      | One row per experiment with every headline number   |
+| `outputs/ablation_summary.json`     | Same information in JSON, easier to parse in notebooks |
+
 ## 4. Individual commands
 
-### Custom CNN baseline
+### Task 2 progressive ablation (Custom CNN)
+
+The six runs below form a single-variable-at-a-time progression.
+Every row adds exactly one technique compared with the row above,
+so any accuracy delta can be attributed to that change alone.
 
 ```bash
+# A. Baseline: nothing but the architecture.
 python -m pet_cw.train \
   --experiment-name custom_baseline \
-  --model custom \
-  --image-size 160 \
-  --batch-size 64 \
-  --epochs 30 \
-  --augmentation none \
-  --weight-decay 0.0 \
-  --dropout 0.30 \
-  --scheduler none \
-  --label-smoothing 0.0 \
+  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --optimizer adamw --lr 1e-3 --dropout 0.3 \
+  --augmentation none --scheduler none \
+  --weight-decay 0.0 --label-smoothing 0.0 --mixup-alpha 0.0 \
   --download --amp --test-at-end
-```
 
-### Custom CNN + augmentation only (single-variable improvement)
-
-```bash
+# B. + strong augmentation (this is the single-variable improvement
+#    the coursework brief asks for in §4).
 python -m pet_cw.train \
-  --experiment-name custom_aug_only \
-  --model custom \
-  --image-size 160 \
-  --batch-size 64 \
-  --epochs 30 \
-  --augmentation strong \
-  --weight-decay 0.0 \
-  --dropout 0.30 \
-  --scheduler none \
-  --label-smoothing 0.0 \
+  --experiment-name custom_aug \
+  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --optimizer adamw --lr 1e-3 --dropout 0.3 \
+  --augmentation strong --scheduler none \
+  --weight-decay 0.0 --label-smoothing 0.0 --mixup-alpha 0.0 \
   --download --amp --test-at-end
-```
 
-The difference between these two runs isolates the effect of data
-augmentation. That is the mandatory experimental improvement
-specified by the coursework brief.
-
-### Custom CNN with every regulariser stacked
-
-```bash
+# C. + warmup + cosine LR schedule.
 python -m pet_cw.train \
-  --experiment-name custom_full_improvement \
-  --model custom \
-  --image-size 160 \
-  --batch-size 64 \
-  --epochs 30 \
-  --augmentation strong \
-  --weight-decay 1e-4 \
-  --dropout 0.45 \
-  --scheduler cosine \
-  --label-smoothing 0.1 \
-  --grad-clip 1.0 \
+  --experiment-name custom_aug_sched \
+  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --optimizer adamw --lr 1e-3 --dropout 0.3 \
+  --augmentation strong --scheduler cosine --warmup-epochs 3 \
+  --weight-decay 0.0 --label-smoothing 0.0 --mixup-alpha 0.0 \
+  --download --amp --test-at-end
+
+# D. + L2 weight decay.
+python -m pet_cw.train \
+  --experiment-name custom_aug_sched_wd \
+  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --optimizer adamw --lr 1e-3 --dropout 0.3 \
+  --augmentation strong --scheduler cosine --warmup-epochs 3 \
+  --weight-decay 1e-4 --label-smoothing 0.0 --mixup-alpha 0.0 \
+  --download --amp --test-at-end
+
+# E. + label smoothing.
+python -m pet_cw.train \
+  --experiment-name custom_aug_sched_wd_ls \
+  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --optimizer adamw --lr 1e-3 --dropout 0.3 \
+  --augmentation strong --scheduler cosine --warmup-epochs 3 \
+  --weight-decay 1e-4 --label-smoothing 0.1 --mixup-alpha 0.0 \
+  --download --amp --test-at-end
+
+# F. + Mixup (the final, best Task 2 configuration).
+python -m pet_cw.train \
+  --experiment-name custom_full \
+  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --optimizer adamw --lr 1e-3 --dropout 0.3 \
+  --augmentation strong --scheduler cosine --warmup-epochs 3 \
+  --weight-decay 1e-4 --label-smoothing 0.1 --mixup-alpha 0.2 \
   --download --amp --test-at-end
 ```
 
-### Transfer learning: frozen backbone (feature extraction)
+Because `--pretrained` defaults to *off*, every Task 2 run here
+trains from random initialisation even though the `custom` model
+would ignore pretrained weights anyway; this keeps the saved
+`run_config.json` honest for markers.
+
+### Task 1 transfer learning (ResNet-18)
 
 ```bash
+# Frozen backbone (feature extraction).
 python -m pet_cw.train \
   --experiment-name transfer_resnet18_frozen \
   --model resnet18 --pretrained --freeze-backbone \
   --image-size 224 --batch-size 32 --epochs 15 \
   --augmentation basic \
   --optimizer adamw --lr 1e-3 --weight-decay 1e-4 \
-  --scheduler cosine --label-smoothing 0.1 \
+  --scheduler cosine --warmup-epochs 1 --label-smoothing 0.1 \
   --download --amp --test-at-end
-```
 
-### Transfer learning: full fine-tune with differential LR
-
-```bash
+# Full fine-tune with differential LR.
 python -m pet_cw.train \
   --experiment-name transfer_resnet18_finetune \
   --model resnet18 --pretrained \
   --image-size 224 --batch-size 32 --epochs 15 \
   --augmentation basic \
   --optimizer adamw --lr 1e-4 --head-lr-mult 10 \
-  --weight-decay 1e-4 --scheduler cosine --label-smoothing 0.1 \
+  --weight-decay 1e-4 --scheduler cosine --warmup-epochs 1 \
+  --label-smoothing 0.1 \
   --download --amp --test-at-end
 ```
 
@@ -295,17 +315,21 @@ python -m pet_cw.predict \
 
 ## 8. Notes on methodology
 
-* Final reported numbers come from the **test split** (the 3669
-  images in `split="test"`). The validation slice taken out of
-  `trainval` is only used for model selection, never for a reported
-  headline number. That is why every run ends with `--test-at-end`.
-* The five runs in `run_recommended_experiments.py` form a single
-  coherent story. Baseline vs `aug_only` is the clean
-  single-variable ablation the coursework requires. `aug_only`
-  vs `full_improvement` quantifies the marginal benefit of
-  stacking scheduler + weight decay + label smoothing + higher
-  dropout on top of augmentation. `frozen` vs `finetune` answers
-  the Lab 6 question about which transfer strategy is better here.
+* The validation accuracy is the headline number reported in the
+  coursework write-up because the brief names "accuracy on the
+  validation set" as the required evaluation metric. The held-out
+  test split is only touched once per run at the very end (enabled
+  by `--test-at-end`) so a single independent check of the same
+  model is also available.
+* The six custom-CNN runs produced by `run_recommended_experiments.py`
+  form a single-variable-at-a-time progression so every increment
+  from baseline to `custom_full` can be attributed to exactly one
+  technique. `baseline → custom_aug` is the augmentation-only
+  ablation the brief explicitly demands in §4; the remaining rows
+  quantify the marginal contribution of LR scheduling, weight
+  decay, label smoothing and Mixup. `transfer_resnet18_frozen`
+  versus `transfer_resnet18_finetune` answers the Lab 6 question
+  about feature extraction versus full fine-tuning on this dataset.
 * `--seed 42` by default. Pass `--deterministic` for bit-exact
   reruns, at a small throughput cost.
 * `PetResNet` has about 2.7M parameters. The classifier head is a

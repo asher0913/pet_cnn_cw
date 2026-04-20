@@ -1,8 +1,12 @@
-torch>=2.2
-torchvision>=0.17
-numpy>=1.24
-matplotlib>=3.7
-scikit-learn>=1.3
-seaborn>=0.13
-pillow>=10.0
-tqdm>=4.66
+# Runtime dependencies pinned to the exact versions used during the
+# development of this coursework. For CUDA-compatible torch/torchvision
+# builds install them via the PyTorch index URL that matches the CUDA
+# version on the target machine (see README.md section 1).
+torch==2.3.1
+torchvision==0.18.1
+numpy==1.26.4
+matplotlib==3.9.0
+scikit-learn==1.5.0
+seaborn==0.13.2
+pillow==10.3.0
+tqdm==4.66.4

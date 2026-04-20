@@ -1,45 +1,54 @@
 """Run every experiment reported in the COMP3065 coursework submission.
 
-Design of the study
--------------------
+The sweep has two parts:
 
-A. ``custom_baseline``
-   Task 2 baseline. No augmentation, no scheduler, no weight decay,
-   no label smoothing. Acts as the reference point; every later
-   improvement is measured as a delta from this row.
+1. Task 2 (Custom CNN) — a progressive, single-variable-at-a-time
+   ablation starting from a pure baseline and adding one regularisation
+   technique at each subsequent step:
 
-B. ``custom_aug_only``
-   Same as A, but with strong data augmentation turned on. Exactly
-   one variable changes compared to the baseline, so the resulting
-   accuracy delta is attributable to augmentation alone. This is
-   the single-variable experimental improvement the brief asks for.
+   A. ``custom_baseline``
+      Reference point. No augmentation, no LR schedule, no weight
+      decay, no label smoothing, no Mixup. Everything else in the
+      sweep measures its delta from this row.
 
-C. ``custom_full_improvement``
-   Strong augmentation + cosine LR schedule + L2 weight decay +
-   label smoothing + higher dropout + gradient clipping. Not a
-   single-variable ablation on top of B; instead a "stack every
-   regulariser" run that shows how much further the Task 2 model
-   can be pushed when the improvements compound.
+   B. ``custom_aug``
+      Adds strong data augmentation (RandomResizedCrop + flip +
+      TrivialAugmentWide + RandomErasing) and nothing else. This is
+      the single-variable experimental improvement the brief asks
+      for in §4: exactly one setting changes relative to A, so the
+      accuracy delta is attributable to augmentation alone.
 
-D. ``transfer_resnet18_frozen``
-   Task 1, feature-extraction strategy. Pretrained ResNet-18 with
-   the backbone frozen, so only the 37-way classifier head trains.
-   The cheaper of the two transfer-learning strategies.
+   C. ``custom_aug_sched``
+      Adds warmup + cosine LR annealing on top of B.
 
-E. ``transfer_resnet18_finetune``
-   Task 1, full fine-tuning strategy. Same network, but the
-   backbone is trainable with a differential learning rate (head
-   learning rate ten times the backbone learning rate). The
-   strategy that usually wins once enough labelled data is
-   available.
+   D. ``custom_aug_sched_wd``
+      Adds L2 weight decay (1e-4) on top of C.
 
-Comparisons
------------
+   E. ``custom_aug_sched_wd_ls``
+      Adds label smoothing 0.1 on top of D.
 
-* A vs B         : clean single-variable ablation (augmentation).
-* B vs C         : diminishing-returns argument for stacked regularisers.
-* D vs E         : Lab 6 question on freeze-vs-fine-tune.
-* C vs {D, E}    : custom CNN against a pretrained alternative.
+   F. ``custom_full``
+      Adds Mixup (alpha = 0.2) on top of E. Together, A→F forms a
+      clean story: each row isolates one technique's contribution so
+      the report can attribute every accuracy gain to a specific
+      design choice.
+
+2. Task 1 (Transfer Learning) — two runs that answer the Lab 6
+   freeze-vs-fine-tune question on a pretrained ResNet-18:
+
+   G. ``transfer_resnet18_frozen``
+      Feature-extraction strategy. Backbone frozen, only the 37-way
+      classifier head trains. Cheap; gives a lower bound on what
+      pretrained features already know about pets.
+
+   H. ``transfer_resnet18_finetune``
+      Full fine-tuning with a differential learning rate: head LR is
+      10x the backbone LR. Typically the strongest configuration
+      once enough labelled data is available.
+
+Every run is 30 epochs for custom and 15 for transfer, which sits
+inside the brief's 10–30 epoch guideline and keeps the whole sweep
+comfortably under two hours on a single modern GPU.
 
 Usage
 -----
@@ -48,23 +57,26 @@ Defaults (data downloads to ``./data``, results written to ``./outputs``)::
 
     python scripts/run_recommended_experiments.py
 
-Override locations, worker count, or a subset of experiments::
+Override locations, worker count, or run a subset::
 
-    python scripts/run_recommended_experiments.py \
+    python scripts/run_recommended_experiments.py \\
         --data-dir /mnt/data --output-dir /mnt/out --num-workers 8
 
-    python scripts/run_recommended_experiments.py --only custom_baseline custom_aug_only
+    python scripts/run_recommended_experiments.py --only custom_baseline custom_aug
 
-A plain Python driver is used (rather than a shell script) because
-the coursework brief specifies Python scripts or notebooks as the
-code deliverable.
+    python scripts/run_recommended_experiments.py --dry-run
+
+A plain Python driver is used (not a shell script) because the
+coursework brief specifies Python scripts or notebooks as the code
+deliverable.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import os
-import shlex
 import socket
 import subprocess
 import sys
@@ -154,7 +166,13 @@ def preflight_dataset(data_dir: str) -> None:
     raise SystemExit(OFFLINE_DATA_HELP.format(base_folder=base_folder))
 
 
-def build_experiments(data_dir: str, output_dir: str, num_workers: int) -> list[dict]:
+def build_experiments(
+    data_dir: str,
+    output_dir: str,
+    num_workers: int,
+    custom_epochs: int,
+    transfer_epochs: int,
+) -> list[dict]:
     """Return one dict per experiment in the ablation.
 
     Each dict is {"name": str, "args": list[str]}. Args are passed
@@ -162,15 +180,18 @@ def build_experiments(data_dir: str, output_dir: str, num_workers: int) -> list[
     into per-run dicts so a filter (``--only``) can select any
     subset without juggling shared-state variables.
     """
+    # Training settings held constant across every custom run in the
+    # progressive ablation. Only the variable under test changes.
     common_custom = [
         "--model", "custom",
         "--data-dir", data_dir,
         "--output-dir", output_dir,
-        "--image-size", "160",
+        "--image-size", "224",
         "--batch-size", "64",
-        "--epochs", "30",
+        "--epochs", str(custom_epochs),
         "--optimizer", "adamw",
         "--lr", "1e-3",
+        "--dropout", "0.3",
         "--num-workers", str(num_workers),
         "--download",
         "--amp",
@@ -182,11 +203,12 @@ def build_experiments(data_dir: str, output_dir: str, num_workers: int) -> list[
         "--output-dir", output_dir,
         "--image-size", "224",
         "--batch-size", "32",
-        "--epochs", "15",
+        "--epochs", str(transfer_epochs),
         "--augmentation", "basic",
         "--optimizer", "adamw",
         "--weight-decay", "1e-4",
         "--scheduler", "cosine",
+        "--warmup-epochs", "1",
         "--label-smoothing", "0.1",
         "--num-workers", str(num_workers),
         "--download",
@@ -195,43 +217,84 @@ def build_experiments(data_dir: str, output_dir: str, num_workers: int) -> list[
     ]
 
     return [
+        # ---- Task 2: progressive single-variable ablation ----
         {
             "name": "custom_baseline",
             "args": [
                 "--experiment-name", "custom_baseline",
                 *common_custom,
                 "--augmentation", "none",
-                "--weight-decay", "0.0",
-                "--dropout", "0.3",
                 "--scheduler", "none",
+                "--weight-decay", "0.0",
                 "--label-smoothing", "0.0",
+                "--mixup-alpha", "0.0",
             ],
         },
         {
-            "name": "custom_aug_only",
+            "name": "custom_aug",
             "args": [
-                "--experiment-name", "custom_aug_only",
+                "--experiment-name", "custom_aug",
                 *common_custom,
                 "--augmentation", "strong",
-                "--weight-decay", "0.0",
-                "--dropout", "0.3",
                 "--scheduler", "none",
+                "--weight-decay", "0.0",
                 "--label-smoothing", "0.0",
+                "--mixup-alpha", "0.0",
             ],
         },
         {
-            "name": "custom_full_improvement",
+            "name": "custom_aug_sched",
             "args": [
-                "--experiment-name", "custom_full_improvement",
+                "--experiment-name", "custom_aug_sched",
                 *common_custom,
                 "--augmentation", "strong",
-                "--weight-decay", "1e-4",
-                "--dropout", "0.45",
                 "--scheduler", "cosine",
-                "--label-smoothing", "0.1",
-                "--grad-clip", "1.0",
+                "--warmup-epochs", "3",
+                "--weight-decay", "0.0",
+                "--label-smoothing", "0.0",
+                "--mixup-alpha", "0.0",
             ],
         },
+        {
+            "name": "custom_aug_sched_wd",
+            "args": [
+                "--experiment-name", "custom_aug_sched_wd",
+                *common_custom,
+                "--augmentation", "strong",
+                "--scheduler", "cosine",
+                "--warmup-epochs", "3",
+                "--weight-decay", "1e-4",
+                "--label-smoothing", "0.0",
+                "--mixup-alpha", "0.0",
+            ],
+        },
+        {
+            "name": "custom_aug_sched_wd_ls",
+            "args": [
+                "--experiment-name", "custom_aug_sched_wd_ls",
+                *common_custom,
+                "--augmentation", "strong",
+                "--scheduler", "cosine",
+                "--warmup-epochs", "3",
+                "--weight-decay", "1e-4",
+                "--label-smoothing", "0.1",
+                "--mixup-alpha", "0.0",
+            ],
+        },
+        {
+            "name": "custom_full",
+            "args": [
+                "--experiment-name", "custom_full",
+                *common_custom,
+                "--augmentation", "strong",
+                "--scheduler", "cosine",
+                "--warmup-epochs", "3",
+                "--weight-decay", "1e-4",
+                "--label-smoothing", "0.1",
+                "--mixup-alpha", "0.2",
+            ],
+        },
+        # ---- Task 1: freeze vs fine-tune on ResNet-18 ----
         {
             "name": "transfer_resnet18_frozen",
             "args": [
@@ -267,39 +330,104 @@ def parse_args() -> argparse.Namespace:
                         help="Parent directory for per-experiment result folders.")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader worker processes per run.")
+    parser.add_argument("--custom-epochs", type=int, default=30,
+                        help="Epochs for each Task 2 (custom CNN) run. Brief allows 10-30.")
+    parser.add_argument("--transfer-epochs", type=int, default=15,
+                        help="Epochs for each Task 1 (transfer learning) run.")
     parser.add_argument("--only", nargs="+", default=None,
-                        help="Subset of experiment names to run (default: all five).")
+                        help="Subset of experiment names to run (default: all).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the commands that would be executed and exit.")
     parser.add_argument("--stop-on-error", action="store_true",
                         help="Abort the whole sweep if any single run exits non-zero.")
+    parser.add_argument("--skip-dataset-check", action="store_true",
+                        help="Skip the local / DNS preflight check for the Oxford-IIIT Pet dataset.")
     return parser.parse_args()
 
 
 def format_command(args: list[str]) -> str:
     """Pretty-print a command for logging."""
-    command = [sys.executable, "-m", TRAIN_MODULE, *args]
-    command_text = " ".join(shlex.quote(part) for part in command)
-    return f"cd {shlex.quote(str(PROJECT_ROOT))} && PYTHONPATH={shlex.quote(str(SRC_DIR))} {command_text}"
+    return " ".join([sys.executable, "-m", TRAIN_MODULE, *args])
 
 
-def run_single_experiment(args: list[str]) -> int:
+def run_single_experiment(args: list[str], env: dict[str, str]) -> int:
     """Launch one training run. Return its exit code."""
     command = [sys.executable, "-m", TRAIN_MODULE, *args]
     # Inherit stdout/stderr so tqdm bars and log lines stream live.
-    process = subprocess.run(command, check=False, cwd=PROJECT_ROOT, env=subprocess_env())
+    process = subprocess.run(command, check=False, env=env)
     return process.returncode
+
+
+def find_latest_run_dir(output_dir: Path, experiment_name: str) -> Path | None:
+    """Return the most recent output folder produced by ``experiment_name``.
+
+    Runs are written as ``<name>_<timestamp>`` so sorting by name finds
+    the latest deterministically. Returns ``None`` if no matching folder
+    exists.
+    """
+    matches = sorted(output_dir.glob(f"{experiment_name}_*"))
+    return matches[-1] if matches else None
+
+
+def aggregate_summaries(output_dir: Path, experiments: list[dict]) -> Path | None:
+    """Collect ``summary.json`` from every completed run into one CSV + JSON.
+
+    Returns the CSV path, or ``None`` if no run produced a summary.
+    This saves having to re-open individual history files when the
+    report draws its comparison table.
+    """
+    rows: list[dict] = []
+    for experiment in experiments:
+        run_dir = find_latest_run_dir(output_dir, experiment["name"])
+        if run_dir is None:
+            continue
+        summary_path = run_dir / "summary.json"
+        if not summary_path.exists():
+            continue
+        with summary_path.open("r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+        summary["run_dir"] = str(run_dir)
+        rows.append(summary)
+
+    if not rows:
+        return None
+
+    # Use the union of keys so a column does not get silently dropped
+    # just because one run is missing it (e.g. test_acc without --test-at-end).
+    all_keys: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in all_keys:
+                all_keys.append(key)
+
+    csv_path = output_dir / "ablation_summary.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=all_keys)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in all_keys})
+
+    json_path = output_dir / "ablation_summary.json"
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(rows, handle, indent=2)
+
+    return csv_path
 
 
 def main() -> None:
     cli = parse_args()
-    cli.data_dir = project_path(cli.data_dir)
-    cli.output_dir = project_path(cli.output_dir)
 
-    Path(cli.output_dir).mkdir(parents=True, exist_ok=True)
-    preflight_dataset(cli.data_dir)
+    data_dir = project_path(cli.data_dir)
+    output_dir = Path(project_path(cli.output_dir))
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    experiments = build_experiments(cli.data_dir, cli.output_dir, cli.num_workers)
+    experiments = build_experiments(
+        data_dir=data_dir,
+        output_dir=str(output_dir),
+        num_workers=cli.num_workers,
+        custom_epochs=cli.custom_epochs,
+        transfer_epochs=cli.transfer_epochs,
+    )
 
     if cli.only:
         wanted = set(cli.only)
@@ -312,6 +440,9 @@ def main() -> None:
             )
         experiments = [experiment for experiment in experiments if experiment["name"] in wanted]
 
+    if not cli.skip_dataset_check and not cli.dry_run:
+        preflight_dataset(data_dir)
+
     print(f"Planning to run {len(experiments)} experiment(s):")
     for experiment in experiments:
         print(f"  - {experiment['name']}")
@@ -323,6 +454,7 @@ def main() -> None:
             print(f"    {format_command(experiment['args'])}")
         return
 
+    env = subprocess_env()
     results: list[tuple[str, int, float]] = []
     sweep_start = time.time()
 
@@ -335,7 +467,7 @@ def main() -> None:
         print()
 
         run_start = time.time()
-        exit_code = run_single_experiment(experiment["args"])
+        exit_code = run_single_experiment(experiment["args"], env)
         elapsed = time.time() - run_start
         results.append((name, exit_code, elapsed))
 
@@ -348,6 +480,9 @@ def main() -> None:
             break
 
     total_elapsed = time.time() - sweep_start
+
+    aggregate_path = aggregate_summaries(output_dir, experiments)
+
     print("=" * 78)
     print("  Sweep summary")
     print("=" * 78)
@@ -355,7 +490,9 @@ def main() -> None:
         status = "OK" if exit_code == 0 else f"FAILED ({exit_code})"
         print(f"  {name:<32s} {status:<14s} {elapsed/60:6.1f} min")
     print(f"  Total wall-clock: {total_elapsed/60:.1f} min")
-    print(f"  Result folders under: {cli.output_dir}")
+    print(f"  Result folders under: {output_dir}")
+    if aggregate_path is not None:
+        print(f"  Aggregated table:     {aggregate_path}")
 
     # Non-zero exit if anything failed, so CI / shell chaining can detect it.
     if any(code != 0 for _, code, _ in results):
