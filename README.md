@@ -70,6 +70,51 @@ PY
 If `torch.cuda.is_available()` is `False`, reinstall `torch` with
 the CUDA build that matches the installed driver.
 
+## 1.1 Dataset setup on servers without internet
+
+The recommended script passes `--download`, so torchvision will try
+to fetch Oxford-IIIT Pet automatically. If the GPU server has no
+internet access or DNS, you will see an error like:
+
+```text
+Temporary failure in name resolution
+urllib.error.URLError
+```
+
+That is a server network problem, not a training-code problem. In
+that case, download the two archives on another machine and copy
+them to the server:
+
+```text
+https://www.robots.ox.ac.uk/~vgg/data/pets/data/images.tar.gz
+https://www.robots.ox.ac.uk/~vgg/data/pets/data/annotations.tar.gz
+```
+
+Then prepare the expected torchvision folder:
+
+```bash
+cd /home/unnc/zhang/pet_cnn_cw
+mkdir -p data/oxford-iiit-pet
+
+# Put images.tar.gz and annotations.tar.gz in data/oxford-iiit-pet first.
+tar -xzf data/oxford-iiit-pet/images.tar.gz -C data/oxford-iiit-pet
+tar -xzf data/oxford-iiit-pet/annotations.tar.gz -C data/oxford-iiit-pet
+```
+
+Expected final structure:
+
+```text
+data/oxford-iiit-pet/images/*.jpg
+data/oxford-iiit-pet/annotations/trainval.txt
+data/oxford-iiit-pet/annotations/test.txt
+```
+
+Once those files exist, rerun:
+
+```bash
+python scripts/run_recommended_experiments.py
+```
+
 ## 2. Run all recommended experiments
 
 A single Python driver runs the full ablation and both transfer

@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+from urllib.error import URLError
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -48,6 +49,27 @@ OXFORD_PET_CLASSES = [
 # work well.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+OXFORD_PET_DOWNLOAD_HINT = """Oxford-IIIT Pet dataset is not available locally and automatic download failed.
+
+If the Linux GPU server has no internet/DNS, prepare the dataset manually:
+
+  1. Download on a machine with internet:
+       https://www.robots.ox.ac.uk/~vgg/data/pets/data/images.tar.gz
+       https://www.robots.ox.ac.uk/~vgg/data/pets/data/annotations.tar.gz
+
+  2. Copy both archives to:
+       {base_folder}
+
+  3. Extract:
+       mkdir -p {base_folder}
+       tar -xzf images.tar.gz -C {base_folder}
+       tar -xzf annotations.tar.gz -C {base_folder}
+
+Expected final structure:
+  {base_folder}/images/*.jpg
+  {base_folder}/annotations/trainval.txt
+  {base_folder}/annotations/test.txt
+"""
 
 
 @dataclass(frozen=True)
@@ -177,13 +199,17 @@ def build_dataloaders(
     train_transform, eval_transform = build_transforms(image_size=image_size, augmentation=augmentation)
 
     # One download call does the work for all three dataset objects.
-    base_dataset = datasets.OxfordIIITPet(
-        root=str(data_dir),
-        split="trainval",
-        target_types="category",
-        download=download,
-        transform=None,
-    )
+    try:
+        base_dataset = datasets.OxfordIIITPet(
+            root=str(data_dir),
+            split="trainval",
+            target_types="category",
+            download=download,
+            transform=None,
+        )
+    except URLError as exc:
+        base_folder = data_dir / "oxford-iiit-pet"
+        raise RuntimeError(OXFORD_PET_DOWNLOAD_HINT.format(base_folder=base_folder)) from exc
     class_names = get_class_names(base_dataset)
     train_indices, val_indices = split_indices(len(base_dataset), val_fraction, seed)
 

@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -77,6 +78,32 @@ from pathlib import Path
 TRAIN_MODULE = "pet_cw.train"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
+OXFORD_PET_HOST = "www.robots.ox.ac.uk"
+
+
+OFFLINE_DATA_HELP = """Oxford-IIIT Pet is not present locally and this machine cannot resolve the dataset host.
+
+Prepare the dataset manually on a machine with internet, then copy it to this server:
+
+  1. Download:
+       https://www.robots.ox.ac.uk/~vgg/data/pets/data/images.tar.gz
+       https://www.robots.ox.ac.uk/~vgg/data/pets/data/annotations.tar.gz
+
+  2. On the Linux GPU server, put both archives under:
+       {base_folder}
+
+  3. Extract them there:
+       mkdir -p {base_folder}
+       tar -xzf images.tar.gz -C {base_folder}
+       tar -xzf annotations.tar.gz -C {base_folder}
+
+  4. Expected final structure:
+       {base_folder}/images/*.jpg
+       {base_folder}/annotations/trainval.txt
+       {base_folder}/annotations/test.txt
+
+After that, rerun this script. The torchvision loader will see the files and skip downloading.
+"""
 
 
 def project_path(path: str) -> str:
@@ -93,6 +120,38 @@ def subprocess_env() -> dict[str, str]:
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(SRC_DIR) if not existing else f"{SRC_DIR}{os.pathsep}{existing}"
     return env
+
+
+def oxford_pet_ready(data_dir: str) -> bool:
+    base_folder = Path(data_dir) / "oxford-iiit-pet"
+    required = [
+        base_folder / "images",
+        base_folder / "annotations",
+        base_folder / "annotations" / "trainval.txt",
+        base_folder / "annotations" / "test.txt",
+    ]
+    return all(path.exists() for path in required)
+
+
+def can_resolve_dataset_host() -> bool:
+    try:
+        socket.getaddrinfo(OXFORD_PET_HOST, 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    return True
+
+
+def preflight_dataset(data_dir: str) -> None:
+    if oxford_pet_ready(data_dir):
+        print(f"Dataset found under: {Path(data_dir) / 'oxford-iiit-pet'}")
+        return
+
+    if can_resolve_dataset_host():
+        print("Dataset not found locally; torchvision will download Oxford-IIIT Pet on the first run.")
+        return
+
+    base_folder = Path(data_dir) / "oxford-iiit-pet"
+    raise SystemExit(OFFLINE_DATA_HELP.format(base_folder=base_folder))
 
 
 def build_experiments(data_dir: str, output_dir: str, num_workers: int) -> list[dict]:
@@ -238,6 +297,7 @@ def main() -> None:
     cli.output_dir = project_path(cli.output_dir)
 
     Path(cli.output_dir).mkdir(parents=True, exist_ok=True)
+    preflight_dataset(cli.data_dir)
 
     experiments = build_experiments(cli.data_dir, cli.output_dir, cli.num_workers)
 
