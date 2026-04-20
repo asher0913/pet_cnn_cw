@@ -171,7 +171,8 @@ class PetResNet(nn.Module):
 
     Parameter count is around 2.7M. On Oxford-IIIT Pet that sits in
     the sweet spot: enough capacity to learn, few enough to train
-    from scratch in 30 epochs without overfitting hard.
+    from scratch in a handful of dozen epochs without overfitting
+    hard.
     """
 
     def __init__(self, num_classes: int = 37, dropout: float = 0.3) -> None:

@@ -46,9 +46,16 @@ The sweep has two parts:
       10x the backbone LR. Typically the strongest configuration
       once enough labelled data is available.
 
-Every run is 30 epochs for custom and 15 for transfer, which sits
-inside the brief's 10–30 epoch guideline and keeps the whole sweep
-comfortably under two hours on a single modern GPU.
+Defaults are 80 epochs for each Task 2 (custom CNN) run and 15 for
+each Task 1 (transfer learning) run. The brief's "e.g. 10–30
+epochs" note is soft guidance ("depending on dataset and
+hardware"); the shorter 30-epoch budget left the from-scratch CNN
+clearly underfit on this ~3k-image split (the cosine schedule had
+already annealed to zero at epoch 30 while training accuracy was
+still climbing through 37 percent), so the custom budget is raised
+to 80. Transfer learning converges far faster on pretrained
+features and stays at 15. Both values are exposed as CLI flags
+(``--custom-epochs`` and ``--transfer-epochs``) for easy adjustment.
 
 Usage
 -----
@@ -77,6 +84,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -330,10 +338,23 @@ def parse_args() -> argparse.Namespace:
                         help="Parent directory for per-experiment result folders.")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader worker processes per run.")
-    parser.add_argument("--custom-epochs", type=int, default=30,
-                        help="Epochs for each Task 2 (custom CNN) run. Brief allows 10-30.")
+    parser.add_argument("--custom-epochs", type=int, default=80,
+                        help="Epochs for each Task 2 (custom CNN) run. The brief's "
+                             "'e.g. 10-30 epochs' is soft guidance explicitly scoped to "
+                             "dataset and hardware availability. On Oxford-IIIT Pet "
+                             "(~3k training images, ~80 per class) a from-scratch CNN "
+                             "with strong augmentation + Mixup needs substantially more "
+                             "gradient steps to reach its asymptote: the previous 30-epoch "
+                             "cosine run finished with train accuracy at only 37 percent, "
+                             "and the scheduler had already annealed the learning rate to "
+                             "zero. 80 epochs leaves the cosine curve with useful head-room "
+                             "past the 60-epoch mark and still runs in about 4.5 minutes "
+                             "per experiment on an RTX 5880 Ada (six experiments, ~30 min "
+                             "total). See Section 2.2 of the brief for the soft-guidance "
+                             "wording.")
     parser.add_argument("--transfer-epochs", type=int, default=15,
-                        help="Epochs for each Task 1 (transfer learning) run.")
+                        help="Epochs for each Task 1 (transfer learning) run. Pretrained "
+                             "features converge in far fewer steps than Task 2.")
     parser.add_argument("--only", nargs="+", default=None,
                         help="Subset of experiment names to run (default: all).")
     parser.add_argument("--dry-run", action="store_true",
@@ -361,20 +382,162 @@ def run_single_experiment(args: list[str], env: dict[str, str]) -> int:
 def find_latest_run_dir(output_dir: Path, experiment_name: str) -> Path | None:
     """Return the most recent output folder produced by ``experiment_name``.
 
-    Runs are written as ``<name>_<timestamp>`` so sorting by name finds
-    the latest deterministically. Returns ``None`` if no matching folder
-    exists.
+    A glob of ``<name>_*`` is not safe here: if one experiment name is a
+    prefix of another (for example ``custom_aug`` prefixes
+    ``custom_aug_sched``), that glob silently captures the longer one
+    and aggregation picks the wrong row. Match the exact
+    ``<name>_YYYYMMDD_HHMMSS`` pattern with a regex instead so
+    ``custom_aug`` only matches directories starting with
+    ``custom_aug_<digits>_<digits>``.
     """
-    matches = sorted(output_dir.glob(f"{experiment_name}_*"))
+    pattern = re.compile(rf"^{re.escape(experiment_name)}_\d{{8}}_\d{{6}}$")
+    matches = sorted(
+        entry for entry in output_dir.iterdir()
+        if entry.is_dir() and pattern.match(entry.name)
+    )
     return matches[-1] if matches else None
 
 
-def aggregate_summaries(output_dir: Path, experiments: list[dict]) -> Path | None:
+VIS_MODULE = "pet_cw.visualize"
+
+# Which experiment names should get Grad-CAM / prediction grids written
+# at the end of the sweep. Task 2 best is ``custom_full``, Task 1 best is
+# the fine-tuned ResNet-18. Frozen ResNet-18 is skipped on purpose: it
+# shares the same backbone weights as the fine-tuned version minus the
+# head, so its Grad-CAM figures would not add new information to the
+# report.
+VISUALISATION_TARGETS = (
+    "custom_full",
+    "transfer_resnet18_finetune",
+)
+
+# Each target produces one grid per (split, filter) combination so the
+# report can show both the model's successes and its characteristic
+# failure modes on the held-out test set.
+VISUALISATION_VIEWS = (
+    ("val", "incorrect"),
+    ("val", "correct"),
+    ("test", "incorrect"),
+    ("test", "correct"),
+)
+
+
+def run_visualisations(
+    output_dir: Path,
+    experiments: list[dict],
+    env: dict[str, str],
+) -> None:
+    """Render prediction + Grad-CAM grids for the two headline models.
+
+    Called once after the whole sweep finishes so the figures show the
+    final trained checkpoints. Failures are logged but do not abort the
+    sweep: the training results remain valid even if one matplotlib
+    call goes wrong.
+    """
+    ran_names = {experiment["name"] for experiment in experiments}
+    for target in VISUALISATION_TARGETS:
+        if target not in ran_names:
+            continue
+        run_dir = find_latest_run_dir(output_dir, target)
+        if run_dir is None:
+            print(f"  [visualise] No run folder found for {target}, skipping.")
+            continue
+        checkpoint = run_dir / "best_model.pt"
+        if not checkpoint.exists():
+            print(f"  [visualise] {checkpoint} missing, skipping.")
+            continue
+
+        for split, filter_mode in VISUALISATION_VIEWS:
+            print(f"  [visualise] {target} / {split} / {filter_mode}")
+            command = [
+                sys.executable, "-m", VIS_MODULE,
+                "--checkpoint", str(checkpoint),
+                "--split", split,
+                "--filter", filter_mode,
+                "--num-samples", "16",
+                "--ncols", "4",
+            ]
+            result = subprocess.run(command, check=False, env=env)
+            if result.returncode != 0:
+                print(
+                    f"  [visualise] Grid failed for {target} "
+                    f"({split}/{filter_mode}); continuing with the rest."
+                )
+
+
+def plot_ablation_chart(rows: list[dict], output_dir: Path) -> Path | None:
+    """Render a grouped bar chart of val / test accuracy across the sweep.
+
+    Importing matplotlib is deferred to this function so a broken
+    matplotlib install cannot prevent the training sweep from running.
+    Returns the path to the PNG, or ``None`` if nothing could be plotted.
+    """
+    if not rows:
+        return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - plotting is best-effort
+        print(f"  [chart] matplotlib unavailable ({exc}); skipping ablation_chart.png.")
+        return None
+
+    # Preserve the order experiments were defined in so the chart reads
+    # A → F → Task 1, matching the report's narrative.
+    ordered = [row for row in rows if "experiment_name" in row]
+    if not ordered:
+        return None
+
+    names = [row["experiment_name"] for row in ordered]
+    val_accs = [float(row.get("best_val_acc") or 0.0) * 100.0 for row in ordered]
+    test_accs = [float(row.get("test_acc") or 0.0) * 100.0 for row in ordered]
+
+    import numpy as np  # local import to match the matplotlib pattern above
+
+    x = np.arange(len(names))
+    width = 0.38
+
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.25 * len(names)), 5.0))
+    bars_val = ax.bar(x - width / 2, val_accs, width, label="Validation accuracy", color="#3b7dd8")
+    bars_test = ax.bar(x + width / 2, test_accs, width, label="Test accuracy", color="#d86b3b")
+
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_title("COMP3065 ablation: validation vs held-out test accuracy")
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=30, ha="right")
+    ax.set_ylim(0, 100)
+    ax.grid(axis="y", linestyle=":", alpha=0.6)
+    ax.legend(loc="upper left")
+
+    # Annotate each bar with its numeric value to save the report writer
+    # having to squint at the axis.
+    for bar_group in (bars_val, bars_test):
+        for bar in bar_group:
+            height = bar.get_height()
+            ax.annotate(
+                f"{height:.1f}",
+                xy=(bar.get_x() + bar.get_width() / 2, height),
+                xytext=(0, 3), textcoords="offset points",
+                ha="center", va="bottom", fontsize=8,
+            )
+
+    fig.tight_layout()
+    chart_path = output_dir / "ablation_chart.png"
+    fig.savefig(chart_path, dpi=180)
+    plt.close(fig)
+    return chart_path
+
+
+def aggregate_summaries(
+    output_dir: Path,
+    experiments: list[dict],
+) -> tuple[Path | None, list[dict]]:
     """Collect ``summary.json`` from every completed run into one CSV + JSON.
 
-    Returns the CSV path, or ``None`` if no run produced a summary.
-    This saves having to re-open individual history files when the
-    report draws its comparison table.
+    Returns ``(csv_path, rows)`` where ``csv_path`` is ``None`` if no
+    run produced a summary. The raw row list is returned too so the
+    caller can feed the same data into the ablation bar chart without
+    re-reading the JSON.
     """
     rows: list[dict] = []
     for experiment in experiments:
@@ -390,7 +553,7 @@ def aggregate_summaries(output_dir: Path, experiments: list[dict]) -> Path | Non
         rows.append(summary)
 
     if not rows:
-        return None
+        return None, []
 
     # Use the union of keys so a column does not get silently dropped
     # just because one run is missing it (e.g. test_acc without --test-at-end).
@@ -411,7 +574,7 @@ def aggregate_summaries(output_dir: Path, experiments: list[dict]) -> Path | Non
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(rows, handle, indent=2)
 
-    return csv_path
+    return csv_path, rows
 
 
 def main() -> None:
@@ -481,8 +644,19 @@ def main() -> None:
 
     total_elapsed = time.time() - sweep_start
 
-    aggregate_path = aggregate_summaries(output_dir, experiments)
+    aggregate_path, aggregate_rows = aggregate_summaries(output_dir, experiments)
+    chart_path = plot_ablation_chart(aggregate_rows, output_dir)
 
+    # Grad-CAM + prediction grids for the two headline models. Only run
+    # them if at least one of them was actually trained in this invocation
+    # (``--only`` lets the user restrict the sweep to a subset).
+    print()
+    print("=" * 78)
+    print("  Rendering visualisations for the headline models")
+    print("=" * 78)
+    run_visualisations(output_dir, experiments, env)
+
+    print()
     print("=" * 78)
     print("  Sweep summary")
     print("=" * 78)
@@ -493,6 +667,8 @@ def main() -> None:
     print(f"  Result folders under: {output_dir}")
     if aggregate_path is not None:
         print(f"  Aggregated table:     {aggregate_path}")
+    if chart_path is not None:
+        print(f"  Ablation bar chart:   {chart_path}")
 
     # Non-zero exit if anything failed, so CI / shell chaining can detect it.
     if any(code != 0 for _, code, _ in results):

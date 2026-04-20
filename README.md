@@ -118,9 +118,11 @@ python scripts/run_recommended_experiments.py
 
 ## 2. Run all recommended experiments
 
-A single Python driver runs the full ablation and both transfer
-strategies. Expect about 90 minutes on a single modern GPU (RTX 3090
-/ A5000 territory), longer on older cards.
+A single Python driver runs the full Task 2 ablation (six custom-CNN
+runs, 80 epochs each) plus both Task 1 transfer strategies
+(frozen / fine-tune, 15 epochs each). End-to-end wall-clock is
+about 30-35 minutes on an RTX 5880 Ada / RTX 4090, roughly 75
+minutes on an RTX 3090 / A5000, longer on older cards.
 
 ```bash
 python scripts/run_recommended_experiments.py
@@ -135,9 +137,18 @@ python scripts/run_recommended_experiments.py \
     --num-workers 8
 
 python scripts/run_recommended_experiments.py \
-    --only custom_baseline custom_aug_only
+    --only custom_baseline custom_aug
 
 python scripts/run_recommended_experiments.py --dry-run
+```
+
+Epoch budgets are configurable on the driver as well, should the
+defaults need to be shortened for a smoke test or stretched for a
+final report run:
+
+```bash
+python scripts/run_recommended_experiments.py \
+    --custom-epochs 80 --transfer-epochs 15
 ```
 
 The driver invokes `python -m pet_cw.train` for each experiment as a
@@ -167,12 +178,21 @@ Test-set artifacts only appear if the run used `--test-at-end`,
 which the recommended driver does for every experiment.
 
 Once every run in the sweep has finished, the driver also writes
-two project-level summary files:
+three project-level artifacts plus a visualisation folder next to
+each headline checkpoint:
 
-| File                                | What it is                                           |
-| ----------------------------------- | ---------------------------------------------------- |
-| `outputs/ablation_summary.csv`      | One row per experiment with every headline number   |
-| `outputs/ablation_summary.json`     | Same information in JSON, easier to parse in notebooks |
+| Artifact                                   | What it is                                           |
+| ------------------------------------------ | ---------------------------------------------------- |
+| `outputs/ablation_summary.csv`             | One row per experiment with every headline number   |
+| `outputs/ablation_summary.json`            | Same information in JSON, easier to parse in notebooks |
+| `outputs/ablation_chart.png`               | Grouped bar chart of val / test accuracy across the full sweep |
+| `outputs/custom_full_*/visualisation/`     | Prediction grids + Grad-CAM overlays for the Task 2 best model (val/test × correct/incorrect) |
+| `outputs/transfer_resnet18_finetune_*/visualisation/` | Same four grids for the Task 1 best model |
+
+That is every figure and table the report needs: the confusion
+matrices and training curves come from the individual run folders,
+the headline comparison comes from `ablation_chart.png`, and the
+Grad-CAM discussion draws on the `visualisation/` folders.
 
 ## 4. Individual commands
 
@@ -186,7 +206,7 @@ so any accuracy delta can be attributed to that change alone.
 # A. Baseline: nothing but the architecture.
 python -m pet_cw.train \
   --experiment-name custom_baseline \
-  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --model custom --image-size 224 --batch-size 64 --epochs 80 \
   --optimizer adamw --lr 1e-3 --dropout 0.3 \
   --augmentation none --scheduler none \
   --weight-decay 0.0 --label-smoothing 0.0 --mixup-alpha 0.0 \
@@ -196,7 +216,7 @@ python -m pet_cw.train \
 #    the coursework brief asks for in §4).
 python -m pet_cw.train \
   --experiment-name custom_aug \
-  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --model custom --image-size 224 --batch-size 64 --epochs 80 \
   --optimizer adamw --lr 1e-3 --dropout 0.3 \
   --augmentation strong --scheduler none \
   --weight-decay 0.0 --label-smoothing 0.0 --mixup-alpha 0.0 \
@@ -205,7 +225,7 @@ python -m pet_cw.train \
 # C. + warmup + cosine LR schedule.
 python -m pet_cw.train \
   --experiment-name custom_aug_sched \
-  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --model custom --image-size 224 --batch-size 64 --epochs 80 \
   --optimizer adamw --lr 1e-3 --dropout 0.3 \
   --augmentation strong --scheduler cosine --warmup-epochs 3 \
   --weight-decay 0.0 --label-smoothing 0.0 --mixup-alpha 0.0 \
@@ -214,7 +234,7 @@ python -m pet_cw.train \
 # D. + L2 weight decay.
 python -m pet_cw.train \
   --experiment-name custom_aug_sched_wd \
-  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --model custom --image-size 224 --batch-size 64 --epochs 80 \
   --optimizer adamw --lr 1e-3 --dropout 0.3 \
   --augmentation strong --scheduler cosine --warmup-epochs 3 \
   --weight-decay 1e-4 --label-smoothing 0.0 --mixup-alpha 0.0 \
@@ -223,7 +243,7 @@ python -m pet_cw.train \
 # E. + label smoothing.
 python -m pet_cw.train \
   --experiment-name custom_aug_sched_wd_ls \
-  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --model custom --image-size 224 --batch-size 64 --epochs 80 \
   --optimizer adamw --lr 1e-3 --dropout 0.3 \
   --augmentation strong --scheduler cosine --warmup-epochs 3 \
   --weight-decay 1e-4 --label-smoothing 0.1 --mixup-alpha 0.0 \
@@ -232,7 +252,7 @@ python -m pet_cw.train \
 # F. + Mixup (the final, best Task 2 configuration).
 python -m pet_cw.train \
   --experiment-name custom_full \
-  --model custom --image-size 224 --batch-size 64 --epochs 30 \
+  --model custom --image-size 224 --batch-size 64 --epochs 80 \
   --optimizer adamw --lr 1e-3 --dropout 0.3 \
   --augmentation strong --scheduler cosine --warmup-epochs 3 \
   --weight-decay 1e-4 --label-smoothing 0.1 --mixup-alpha 0.2 \
@@ -278,7 +298,7 @@ faster" recipe.
 
 ```bash
 python -m pet_cw.evaluate \
-  --checkpoint outputs/custom_full_improvement_*/best_model.pt \
+  --checkpoint outputs/custom_full_*/best_model.pt \
   --device auto
 ```
 
