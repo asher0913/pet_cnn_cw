@@ -132,7 +132,14 @@ stability / test-time techniques on top of the preceding row:
 * **EMA** — an exponential moving average of model weights (Polyak
   averaging, standard in EfficientNet / ConvNeXt / DeiT). The shadow
   weights are used for validation and are persisted as
-  `best_model.pt`.
+  `best_model.pt`. The update uses a bias-corrected decay schedule
+  `eff_decay = min(decay, (1+n)/(10+n))` (timm / fastai / EfficientNet
+  reference) so the shadow is not contaminated by the random Kaiming
+  init during the first few hundred updates. The raw training weights
+  are also saved to `best_model_raw.pt` whenever EMA is on, as a
+  safety fallback for re-evaluation. When EMA is active, `history.csv`
+  logs `val_acc` (on the shadow) alongside `val_acc_raw` (on the
+  training weights) so any EMA/raw divergence is visible per epoch.
 * **`min_lr = 1e-5`** — non-zero floor on the cosine schedule so the
   last few epochs keep making small but useful updates.
 * **Horizontal-flip TTA** — at the final `--test-at-end` evaluation,
@@ -286,13 +293,17 @@ python -m pet_cw.train \
 # G. + EMA + cosine min_lr + TTA (the final, best Task 2 configuration).
 #    EMA and min_lr change how training proceeds; TTA applies only at
 #    --test-at-end and reports a second ``test_acc_tta`` number.
+#    Note: this row is layered on E (``custom_aug_sched_wd_ls``), not F
+#    (``custom_full``): Mixup regressed validation accuracy on this
+#    dataset and its interpolated BN statistics compounded unhelpfully
+#    with EMA averaging, so ``--mixup-alpha`` is back to 0 here.
 python -m pet_cw.train \
   --experiment-name custom_full_ema \
   --model custom --image-size 224 --batch-size 64 --epochs 80 \
   --optimizer adamw --lr 1e-3 --dropout 0.3 \
   --augmentation strong --scheduler cosine --warmup-epochs 3 \
-  --weight-decay 1e-4 --label-smoothing 0.1 --mixup-alpha 0.2 \
-  --ema --ema-decay 0.999 --min-lr 1e-5 --tta \
+  --weight-decay 1e-4 --label-smoothing 0.1 --mixup-alpha 0.0 \
+  --ema --ema-decay 0.9999 --min-lr 1e-5 --tta \
   --download --amp --test-at-end
 ```
 

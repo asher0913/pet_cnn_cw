@@ -63,29 +63,60 @@ class ModelEma:
     shadow copy of the network weights, updated after every optimiser
     step as::
 
-        shadow := decay * shadow + (1 - decay) * current
+        shadow := eff_decay * shadow + (1 - eff_decay) * current
 
-    Evaluation then runs against the shadow rather than the raw
-    weights. The shadow is a low-pass filtered version of the training
-    trajectory, so it damps out the noise that SGD-style updates leave
-    on the last few steps and usually lifts validation / test
-    accuracy by 0.5 - 2 percentage points at essentially zero extra
-    cost. EMA is standard in modern recipes (EfficientNet, ConvNeXt,
-    DeiT, timm).
+    where ``eff_decay`` is the *bias-corrected* decay (see below).
 
-    Notes on edge cases:
+    Why the bias correction matters
+    -------------------------------
+
+    A naive ``decay = 0.999`` schedule is the formula that gets
+    quoted most often in tutorials, but it has a pitfall when the
+    model is trained from scratch: the shadow is *initialised* with
+    whatever weights the model starts with, which for Task 2 are the
+    random Kaiming init. If that shadow is then updated with decay =
+    0.999 for 3680 steps (80 epochs x 46 batches), the final shadow
+    still retains ``exp(-3680 * 0.001) approx 2.5 percent`` of the
+    original random initialisation mixed in with the trained
+    weights. On a small fine-grained dataset like Oxford-IIIT Pet
+    this contamination is enough to visibly regress the EMA
+    checkpoint below the raw training checkpoint - exactly what we
+    observed empirically with the first, un-corrected version of
+    this class.
+
+    The standard fix, used by timm, fastai and the EfficientNet
+    reference code, is a *decay warmup*::
+
+        eff_decay = min(decay, (1 + n) / (10 + n))
+
+    where ``n`` is the number of updates. The effect is to let the
+    shadow track the current weights aggressively for the first few
+    iterations (``n = 0`` gives ``eff_decay = 0.1``, so ``shadow``
+    jumps almost entirely to ``current``), then smoothly tighten
+    towards the nominal ``decay`` as training progresses. The
+    contamination from the random init is flushed out within the
+    first couple of hundred steps.
+
+    Notes on edge cases
+    -------------------
 
     * BatchNorm tracks two floating-point buffers (``running_mean``
       and ``running_var``); those are EMA-averaged in the normal way.
-    * BatchNorm also tracks ``num_batches_tracked`` as ``int64``. That
-      buffer is copied verbatim rather than averaged, since a weighted
-      mean of integer step counts makes no sense.
-    * ``state_dict`` (not ``named_parameters``) is used as the
-      iteration target so both learnable weights and buffers get
-      shadowed. This matches what timm does and is important for BN.
+    * BatchNorm also tracks ``num_batches_tracked`` as ``int64``.
+      That buffer is copied verbatim rather than averaged, since a
+      weighted mean of integer step counts makes no sense.
+    * ``state_dict`` (not ``named_parameters``) is the iteration
+      target so both learnable weights and buffers get shadowed.
+      This matches what timm does and is important for BN.
     """
 
-    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+    # Warmup factor in the bias-correction schedule. 10 is the value
+    # used by timm / EfficientNet / fastai; it gives eff_decay = 0.91
+    # at step 100, 0.99 at step 989 and plateaus near the nominal
+    # ``decay`` for the rest of training.
+    BIAS_WARMUP = 10
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
         self.decay = float(decay)
         # Clone on-device so per-step updates are in-place GPU ops.
         # Memory overhead is the model's weight footprint, which is a
@@ -95,15 +126,27 @@ class ModelEma:
             name: tensor.detach().clone()
             for name, tensor in model.state_dict().items()
         }
+        self.num_updates = 0
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        """Apply one EMA update step using ``model``'s current weights."""
+        """Apply one EMA update step using ``model``'s current weights.
+
+        The effective decay is the bias-corrected schedule described
+        in the class docstring. Each call bumps ``num_updates`` first
+        so the very first update uses ``eff_decay = 2 / 11 approx
+        0.18`` rather than zero.
+        """
+        self.num_updates += 1
+        eff_decay = min(
+            self.decay,
+            (1.0 + self.num_updates) / (self.BIAS_WARMUP + self.num_updates),
+        )
         for name, tensor in model.state_dict().items():
             shadow_tensor = self.shadow[name]
             if tensor.dtype.is_floating_point:
-                shadow_tensor.mul_(self.decay).add_(
-                    tensor.detach(), alpha=1.0 - self.decay,
+                shadow_tensor.mul_(eff_decay).add_(
+                    tensor.detach(), alpha=1.0 - eff_decay,
                 )
             else:
                 # Integer buffers (num_batches_tracked) just get copied.
@@ -197,9 +240,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ema", action="store_true",
                         help="Maintain an EMA of model weights and use it for validation and "
                              "checkpointing (Polyak averaging). Standard in modern recipes.")
-    parser.add_argument("--ema-decay", type=float, default=0.999,
-                        help="EMA decay. 0.999 is a safe default for training runs of 15-100 "
-                             "epochs; higher decay (0.9999) is used when training is very long.")
+    parser.add_argument("--ema-decay", type=float, default=0.9999,
+                        help="Nominal EMA decay (the asymptotic value). The effective decay "
+                             "used per step is bias-corrected via min(decay, (1+n)/(10+n)) "
+                             "so the shadow is not contaminated by the random init during "
+                             "the first few hundred updates - see ModelEma for details. "
+                             "0.9999 matches the timm / EfficientNet default; 0.999 is fine "
+                             "for very short runs too.")
     parser.add_argument("--tta", action="store_true",
                         help="Apply horizontal-flip test-time augmentation during --test-at-end. "
                              "Averages logits from the original image and its horizontal flip; "
@@ -593,12 +640,25 @@ def main() -> None:
             ema=ema,
         )
 
-        # When EMA is active the validation numbers that drive model
-        # selection must come from the EMA weights, not the raw ones
-        # (otherwise the checkpoint we save and the metric we compare
-        # on would reference different weight snapshots). Swap the EMA
-        # weights in, evaluate, and swap the training weights back so
-        # the next epoch continues from where it left off.
+        # When EMA is active we run validation twice: once on the raw
+        # training weights, once on the EMA shadow. The EMA number is
+        # the one used for model selection (because the saved
+        # checkpoint is the EMA state), but the raw number is logged
+        # too so the report can diagnose any EMA/raw divergence and
+        # so a failed EMA run is immediately visible in history.csv
+        # rather than hiding behind a single merged metric.
+        val_loss_raw: float | None = None
+        val_acc_raw: float | None = None
+        if ema is not None:
+            with torch.no_grad():
+                val_loss_raw, val_acc_raw, _, _ = run_one_epoch(
+                    model=model, loader=data.val_loader,
+                    criterion=criterion, optimizer=None,
+                    device=device, scaler=None, use_amp=use_amp,
+                    grad_clip=0.0,
+                    epoch=epoch, phase="val(raw)",
+                )
+
         ema_backup: dict[str, torch.Tensor] | None = None
         if ema is not None:
             ema_backup = ema.apply_to(unwrap_compiled(model))
@@ -633,6 +693,13 @@ def main() -> None:
             "lr": float(current_lr),
             "epoch_seconds": float(epoch_seconds),
         }
+        # When EMA is active, also log the raw-weight validation
+        # numbers so the report can show EMA vs raw side-by-side.
+        # Keys are absent for non-EMA runs so history.csv stays
+        # narrow in that case.
+        if ema is not None:
+            row["val_loss_raw"] = float(val_loss_raw) if val_loss_raw is not None else 0.0
+            row["val_acc_raw"] = float(val_acc_raw) if val_acc_raw is not None else 0.0
         history.append(row)
         write_history_csv(run_dir / "history.csv", history)
         plot_training_curves(run_dir / "training_curves.png", history)
@@ -640,9 +707,12 @@ def main() -> None:
         # When EMA is active the canonical weights for evaluation are
         # the shadow ones, so we persist those as ``model_state`` and
         # evaluate.py / visualize.py load them transparently without
-        # needing to know EMA was used. Raw training weights are not
-        # saved separately: resuming from a checkpoint is not a
-        # feature of this project.
+        # needing to know EMA was used. The raw training weights are
+        # also saved to ``best_model_raw.pt`` whenever EMA is on, as
+        # a safety fallback: if the EMA weights underperform (we have
+        # seen this when Mixup is combined with a heavily-averaged
+        # shadow on this small dataset), the raw checkpoint is
+        # available for re-evaluation without retraining.
         if ema is not None:
             weights_for_checkpoint = ema.state_dict()
         else:
@@ -663,16 +733,36 @@ def main() -> None:
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(payload, best_path)
+            # Sibling raw-weight checkpoint: same payload format but
+            # with the training weights instead of the EMA shadow.
+            if ema is not None:
+                raw_payload = checkpoint_payload(
+                    model_state=unwrap_compiled(model).state_dict(),
+                    args=args,
+                    class_names=data.class_names,
+                    train_indices=data.train_indices,
+                    val_indices=data.val_indices,
+                    epoch=epoch,
+                    best_val_acc=max(best_val_acc, val_acc),
+                )
+                torch.save(raw_payload, run_dir / "best_model_raw.pt")
             save_confusion_outputs(run_dir, val_targets, val_predictions,
                                    data.class_names, prefix="validation")
             save_per_class_accuracy_bar(run_dir, val_targets, val_predictions,
                                         data.class_names, prefix="validation")
             print(f"Epoch {epoch}: new best val acc = {val_acc:.4f}")
 
-        print(f"Epoch {epoch:03d}/{args.epochs:03d}  "
-              f"train_loss={train_loss:.4f} train_acc={train_acc:.4f}  "
-              f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}  "
-              f"lr={current_lr:.6f}  time={epoch_seconds:.1f}s")
+        if ema is not None and val_acc_raw is not None:
+            print(f"Epoch {epoch:03d}/{args.epochs:03d}  "
+                  f"train_loss={train_loss:.4f} train_acc={train_acc:.4f}  "
+                  f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} (ema)  "
+                  f"val_acc_raw={val_acc_raw:.4f}  "
+                  f"lr={current_lr:.6f}  time={epoch_seconds:.1f}s")
+        else:
+            print(f"Epoch {epoch:03d}/{args.epochs:03d}  "
+                  f"train_loss={train_loss:.4f} train_acc={train_acc:.4f}  "
+                  f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}  "
+                  f"lr={current_lr:.6f}  time={epoch_seconds:.1f}s")
 
     total_training_seconds = time.time() - training_start
     mean_epoch_seconds = (

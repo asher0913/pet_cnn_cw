@@ -334,12 +334,40 @@ def build_experiments(
             ],
         },
         {
-            # Same knobs as ``custom_full`` plus EMA, a non-zero
-            # cosine floor (min_lr = 1e-5), and horizontal-flip TTA.
-            # All three are orthogonal training-stability / test-time
-            # techniques; none of them add architectural capacity or
-            # touch the data pipeline, so the coursework's custom-CNN
-            # rule is unaffected.
+            # NOTE ON BASE CONFIGURATION
+            # --------------------------
+            # This row layers EMA + cosine min_lr + TTA on top of the
+            # *empirically best* algorithmic configuration (E,
+            # ``custom_aug_sched_wd_ls``), NOT on top of F
+            # (``custom_full``) which additionally enables Mixup.
+            #
+            # The A -> F ablation showed Mixup regressed both
+            # validation and test accuracy on this small (3k-image)
+            # fine-grained dataset: the interpolated training
+            # distribution biases the BatchNorm running statistics
+            # away from the clean-image validation distribution, and
+            # the averaging inherent in EMA compounds that bias. In
+            # initial experiments, layering EMA on the F recipe
+            # regressed validation accuracy by nearly 7 percentage
+            # points compared with F alone.
+            #
+            # Basing the EMA row on E eliminates that pathological
+            # interaction and gives the generic stability / test-time
+            # techniques a clean base to improve on. The ablation
+            # story for the report is therefore:
+            #
+            #   A -> E: single-variable algorithmic ablation
+            #   E -> F: isolated study of Mixup on this dataset
+            #           (expected and observed to regress)
+            #   E -> G: E + EMA + min_lr + TTA (this row) = headline
+            #           Task 2 number
+            #
+            # EMA / min_lr / TTA are still single-variable-at-a-time
+            # techniques, just grouped into one row because they are
+            # orthogonal (EMA changes how weights are accumulated,
+            # min_lr changes the LR tail, TTA changes only test-time
+            # evaluation) and none of them modify the training loss
+            # or architecture.
             "name": "custom_full_ema",
             "args": [
                 "--experiment-name", "custom_full_ema",
@@ -349,9 +377,10 @@ def build_experiments(
                 "--warmup-epochs", "3",
                 "--weight-decay", "1e-4",
                 "--label-smoothing", "0.1",
-                "--mixup-alpha", "0.2",
+                # No Mixup. See rationale above.
+                "--mixup-alpha", "0.0",
                 "--ema",
-                "--ema-decay", "0.999",
+                "--ema-decay", "0.9999",
                 "--min-lr", "1e-5",
                 "--tta",
             ],
@@ -681,24 +710,32 @@ def main() -> None:
     output_dir = Path(project_path(cli.output_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    experiments = build_experiments(
+    # ``all_experiments`` is the full sweep definition; ``experiments``
+    # is the (possibly filtered) subset actually launched in this
+    # invocation. Keeping both lets aggregation and visualisations pick
+    # up previously-completed runs from ``outputs/`` even when the
+    # user is re-running only a subset via ``--only`` (for example,
+    # re-running just the EMA row after fixing its config should not
+    # shrink ablation_summary.csv to a single line).
+    all_experiments = build_experiments(
         data_dir=data_dir,
         output_dir=str(output_dir),
         num_workers=cli.num_workers,
         custom_epochs=cli.custom_epochs,
         transfer_epochs=cli.transfer_epochs,
     )
+    experiments = all_experiments
 
     if cli.only:
         wanted = set(cli.only)
-        known = {experiment["name"] for experiment in experiments}
+        known = {experiment["name"] for experiment in all_experiments}
         unknown = wanted - known
         if unknown:
             raise SystemExit(
                 f"Unknown experiment name(s): {sorted(unknown)}. "
                 f"Choose from: {sorted(known)}"
             )
-        experiments = [experiment for experiment in experiments if experiment["name"] in wanted]
+        experiments = [experiment for experiment in all_experiments if experiment["name"] in wanted]
 
     if not cli.skip_dataset_check and not cli.dry_run:
         preflight_dataset(data_dir)
@@ -741,17 +778,20 @@ def main() -> None:
 
     total_elapsed = time.time() - sweep_start
 
-    aggregate_path, aggregate_rows = aggregate_summaries(output_dir, experiments)
+    # Aggregate over the *full* experiment list, not just what was run
+    # this invocation, so re-running one row via --only still produces
+    # a complete ablation_summary.csv.
+    aggregate_path, aggregate_rows = aggregate_summaries(output_dir, all_experiments)
     chart_path = plot_ablation_chart(aggregate_rows, output_dir)
 
-    # Grad-CAM + prediction grids for the two headline models. Only run
-    # them if at least one of them was actually trained in this invocation
-    # (``--only`` lets the user restrict the sweep to a subset).
+    # Grad-CAM + prediction grids for the headline models. Use the full
+    # experiment list so a ``--only`` subset does not skip visualisation
+    # of a target whose checkpoint already exists on disk.
     print()
     print("=" * 78)
     print("  Rendering visualisations for the headline models")
     print("=" * 78)
-    run_visualisations(output_dir, experiments, env)
+    run_visualisations(output_dir, all_experiments, env)
 
     print()
     print("=" * 78)
