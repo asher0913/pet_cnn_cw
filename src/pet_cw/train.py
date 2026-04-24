@@ -56,6 +56,80 @@ from pet_cw.utils import (
 )
 
 
+class ModelEma:
+    """Exponential moving average (EMA) of model parameters and buffers.
+
+    Classic Polyak averaging (Polyak and Juditsky, 1992) that keeps a
+    shadow copy of the network weights, updated after every optimiser
+    step as::
+
+        shadow := decay * shadow + (1 - decay) * current
+
+    Evaluation then runs against the shadow rather than the raw
+    weights. The shadow is a low-pass filtered version of the training
+    trajectory, so it damps out the noise that SGD-style updates leave
+    on the last few steps and usually lifts validation / test
+    accuracy by 0.5 - 2 percentage points at essentially zero extra
+    cost. EMA is standard in modern recipes (EfficientNet, ConvNeXt,
+    DeiT, timm).
+
+    Notes on edge cases:
+
+    * BatchNorm tracks two floating-point buffers (``running_mean``
+      and ``running_var``); those are EMA-averaged in the normal way.
+    * BatchNorm also tracks ``num_batches_tracked`` as ``int64``. That
+      buffer is copied verbatim rather than averaged, since a weighted
+      mean of integer step counts makes no sense.
+    * ``state_dict`` (not ``named_parameters``) is used as the
+      iteration target so both learnable weights and buffers get
+      shadowed. This matches what timm does and is important for BN.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = float(decay)
+        # Clone on-device so per-step updates are in-place GPU ops.
+        # Memory overhead is the model's weight footprint, which is a
+        # few tens of MB even for ResNet-18 - trivial on the GPUs this
+        # project targets.
+        self.shadow: dict[str, torch.Tensor] = {
+            name: tensor.detach().clone()
+            for name, tensor in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        """Apply one EMA update step using ``model``'s current weights."""
+        for name, tensor in model.state_dict().items():
+            shadow_tensor = self.shadow[name]
+            if tensor.dtype.is_floating_point:
+                shadow_tensor.mul_(self.decay).add_(
+                    tensor.detach(), alpha=1.0 - self.decay,
+                )
+            else:
+                # Integer buffers (num_batches_tracked) just get copied.
+                shadow_tensor.copy_(tensor)
+
+    def apply_to(self, model: nn.Module) -> dict[str, torch.Tensor]:
+        """Temporarily swap EMA weights into ``model``.
+
+        Returns the original state dict so the caller can restore the
+        training weights after validation is done.
+        """
+        backup = {
+            name: tensor.detach().clone()
+            for name, tensor in model.state_dict().items()
+        }
+        model.load_state_dict(self.shadow)
+        return backup
+
+    def restore(self, model: nn.Module, backup: dict[str, torch.Tensor]) -> None:
+        """Reverse a prior :meth:`apply_to` call."""
+        model.load_state_dict(backup)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return self.shadow
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train models for the COMP3065 pet-classification coursework.")
 
@@ -115,6 +189,21 @@ def parse_args() -> argparse.Namespace:
                         help="Max grad norm. 0 disables clipping.")
     parser.add_argument("--head-lr-mult", type=float, default=10.0,
                         help="Multiplier on the new classifier head's LR for transfer fine-tuning.")
+    parser.add_argument("--min-lr", type=float, default=0.0,
+                        help="Cosine scheduler LR floor (passed as eta_min). The default 0 "
+                             "is what CosineAnnealingLR already does; set to e.g. 1e-5 to keep "
+                             "the last few epochs making small but useful updates instead of "
+                             "coasting at zero LR.")
+    parser.add_argument("--ema", action="store_true",
+                        help="Maintain an EMA of model weights and use it for validation and "
+                             "checkpointing (Polyak averaging). Standard in modern recipes.")
+    parser.add_argument("--ema-decay", type=float, default=0.999,
+                        help="EMA decay. 0.999 is a safe default for training runs of 15-100 "
+                             "epochs; higher decay (0.9999) is used when training is very long.")
+    parser.add_argument("--tta", action="store_true",
+                        help="Apply horizontal-flip test-time augmentation during --test-at-end. "
+                             "Averages logits from the original image and its horizontal flip; "
+                             "adds nothing to training cost and typically +0.5-1.5 points on test.")
 
     # --- System ---
     parser.add_argument("--seed", type=int, default=42)
@@ -182,7 +271,11 @@ def build_scheduler(args: argparse.Namespace, optimizer: Optimizer):
     if args.scheduler == "cosine":
         warmup = max(int(args.warmup_epochs), 0)
         cosine_epochs = max(args.epochs - warmup, 1)
-        cosine = CosineAnnealingLR(optimizer, T_max=cosine_epochs)
+        # eta_min keeps the LR floor above zero in the cosine tail. Leaving
+        # it at zero wastes the last few epochs - CosineAnnealingLR hits
+        # exactly zero for the final step and the model coasts. A tiny
+        # floor like 1e-5 lets those epochs keep refining the weights.
+        cosine = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=float(args.min_lr))
         if warmup == 0:
             return cosine
         # Start at start_factor * base_lr and linearly ramp to base_lr
@@ -248,6 +341,7 @@ def run_one_epoch(
     epoch: int,
     phase: str,
     mixup_alpha: float = 0.0,
+    ema: ModelEma | None = None,
 ) -> tuple[float, float, list[int], list[int]]:
     """Run one pass over ``loader`` in either train or eval mode.
 
@@ -322,6 +416,13 @@ def run_one_epoch(
                         )
                     optimizer.step()
 
+                # EMA update runs after every parameter step. If the AMP
+                # scaler skipped this step due to a non-finite gradient
+                # the model's weights are unchanged and the update is
+                # effectively a no-op - safe to call unconditionally.
+                if ema is not None:
+                    ema.update(unwrap_compiled(model))
+
         batch_size = targets.size(0)
         loss_meter.update(loss.item(), batch_size)
 
@@ -337,6 +438,54 @@ def run_one_epoch(
             loss=f"{loss_meter.average:.4f}",
             acc=f"{correct_total / max(sample_total, 1):.4f}",
         )
+
+    accuracy = correct_total / max(sample_total, 1)
+    return loss_meter.average, accuracy, all_targets, all_predictions
+
+
+def run_tta_evaluation(
+    model: nn.Module,
+    loader,
+    criterion: nn.Module,
+    device: torch.device,
+    use_amp: bool,
+) -> tuple[float, float, list[int], list[int]]:
+    """Evaluate with horizontal-flip test-time augmentation.
+
+    The model runs forward twice per batch: once on the batch as-is,
+    once on the batch flipped left-to-right. The two logit tensors are
+    averaged before taking argmax. Cats and dogs are bilaterally
+    symmetric so flipping does not create unrealistic views; the flip
+    pair exposes the model to a second "look" at the same animal and
+    averaging reduces prediction variance.
+
+    TTA is strictly a test-time technique - training is untouched - so
+    it does not change the architecture or add parameters, and it
+    therefore stays inside the coursework's permitted methods.
+    """
+    model.eval()
+    loss_meter = AverageMeter()
+    correct_total = 0
+    sample_total = 0
+    all_targets: list[int] = []
+    all_predictions: list[int] = []
+
+    with torch.no_grad():
+        for images, targets in tqdm(loader, desc="test (TTA)", leave=False):
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits_main = model(images)
+                logits_flip = model(torch.flip(images, dims=[3]))
+                logits = (logits_main + logits_flip) * 0.5
+                loss = criterion(logits, targets)
+
+            loss_meter.update(loss.item(), targets.size(0))
+            predictions = torch.argmax(logits, dim=1)
+            correct_total += (predictions == targets).sum().item()
+            sample_total += targets.size(0)
+            all_targets.extend(targets.detach().cpu().tolist())
+            all_predictions.extend(predictions.cpu().tolist())
 
     accuracy = correct_total / max(sample_total, 1)
     return loss_meter.average, accuracy, all_targets, all_predictions
@@ -415,6 +564,15 @@ def main() -> None:
     # New torch.amp API. The old torch.cuda.amp.* is deprecated.
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    # EMA is built against the unwrapped model so its state-dict keys
+    # match those we later load into the model (torch.compile adds an
+    # _orig_mod. prefix that would otherwise have to be stripped).
+    ema: ModelEma | None = None
+    if args.ema:
+        ema = ModelEma(unwrap_compiled(model), decay=args.ema_decay)
+        print(f"EMA enabled with decay={args.ema_decay}. "
+              f"Validation and best_model.pt will use the EMA weights.")
+
     history: list[dict[str, float]] = []
     best_val_acc = -1.0
     best_path = run_dir / "best_model.pt"
@@ -432,16 +590,30 @@ def main() -> None:
             grad_clip=args.grad_clip,
             epoch=epoch, phase="train",
             mixup_alpha=args.mixup_alpha,
+            ema=ema,
         )
 
-        with torch.no_grad():
-            val_loss, val_acc, val_targets, val_predictions = run_one_epoch(
-                model=model, loader=data.val_loader,
-                criterion=criterion, optimizer=None,
-                device=device, scaler=None, use_amp=use_amp,
-                grad_clip=0.0,
-                epoch=epoch, phase="val",
-            )
+        # When EMA is active the validation numbers that drive model
+        # selection must come from the EMA weights, not the raw ones
+        # (otherwise the checkpoint we save and the metric we compare
+        # on would reference different weight snapshots). Swap the EMA
+        # weights in, evaluate, and swap the training weights back so
+        # the next epoch continues from where it left off.
+        ema_backup: dict[str, torch.Tensor] | None = None
+        if ema is not None:
+            ema_backup = ema.apply_to(unwrap_compiled(model))
+        try:
+            with torch.no_grad():
+                val_loss, val_acc, val_targets, val_predictions = run_one_epoch(
+                    model=model, loader=data.val_loader,
+                    criterion=criterion, optimizer=None,
+                    device=device, scaler=None, use_amp=use_amp,
+                    grad_clip=0.0,
+                    epoch=epoch, phase="val",
+                )
+        finally:
+            if ema is not None and ema_backup is not None:
+                ema.restore(unwrap_compiled(model), ema_backup)
         epoch_seconds = time.time() - epoch_start
 
         # Plateau scheduler needs a metric. Others just step per epoch.
@@ -465,8 +637,19 @@ def main() -> None:
         write_history_csv(run_dir / "history.csv", history)
         plot_training_curves(run_dir / "training_curves.png", history)
 
+        # When EMA is active the canonical weights for evaluation are
+        # the shadow ones, so we persist those as ``model_state`` and
+        # evaluate.py / visualize.py load them transparently without
+        # needing to know EMA was used. Raw training weights are not
+        # saved separately: resuming from a checkpoint is not a
+        # feature of this project.
+        if ema is not None:
+            weights_for_checkpoint = ema.state_dict()
+        else:
+            weights_for_checkpoint = unwrap_compiled(model).state_dict()
+
         payload = checkpoint_payload(
-            model_state=unwrap_compiled(model).state_dict(),
+            model_state=weights_for_checkpoint,
             args=args,
             class_names=data.class_names,
             train_indices=data.train_indices,
@@ -500,6 +683,7 @@ def main() -> None:
     # The best checkpoint is always restored first so numbers match
     # the model actually being reported in the writeup.
     test_acc: float | None = None
+    test_acc_tta: float | None = None
     if args.test_at_end:
         print("\nEvaluating the best checkpoint on the test split...")
         checkpoint = torch.load(best_path, map_location=device, weights_only=False)
@@ -516,6 +700,24 @@ def main() -> None:
         save_per_class_accuracy_bar(run_dir, test_targets, test_predictions,
                                     data.class_names, prefix="test")
         print(f"Test loss={test_loss:.4f}  test_acc={test_acc:.4f}")
+
+        # TTA evaluation reuses the exact same checkpoint - the single
+        # number that changes is how predictions are aggregated at
+        # test time. Both numbers are reported so the report can
+        # quantify the TTA contribution independently of EMA.
+        if args.tta:
+            print("Running test-time augmentation (horizontal flip average)...")
+            tta_loss, test_acc_tta, tta_targets, tta_predictions = run_tta_evaluation(
+                model=model, loader=data.test_loader,
+                criterion=criterion,
+                device=device, use_amp=use_amp,
+            )
+            save_confusion_outputs(run_dir, tta_targets, tta_predictions,
+                                   data.class_names, prefix="test_tta")
+            save_per_class_accuracy_bar(run_dir, tta_targets, tta_predictions,
+                                        data.class_names, prefix="test_tta")
+            print(f"Test (TTA) loss={tta_loss:.4f}  test_acc_tta={test_acc_tta:.4f}  "
+                  f"(delta vs no TTA: {(test_acc_tta - test_acc) * 100:+.2f} pp)")
 
     # summary.json collects every number the report is likely to cite,
     # so the aggregation script does not have to re-open each history.csv.
@@ -535,6 +737,10 @@ def main() -> None:
         "label_smoothing": args.label_smoothing,
         "mixup_alpha": args.mixup_alpha,
         "augmentation": args.augmentation,
+        "ema": bool(args.ema),
+        "ema_decay": float(args.ema_decay) if args.ema else 0.0,
+        "min_lr": float(args.min_lr),
+        "tta": bool(args.tta),
         "total_parameters": total_params,
         "trainable_parameters": trainable_params,
         "best_val_acc": float(best_val_acc),
@@ -544,11 +750,15 @@ def main() -> None:
     }
     if test_acc is not None:
         summary["test_acc"] = float(test_acc)
+    if test_acc_tta is not None:
+        summary["test_acc_tta"] = float(test_acc_tta)
     save_json(run_dir / "summary.json", summary)
 
     print(f"\nDone. Best validation accuracy: {best_val_acc:.4f}")
     if test_acc is not None:
         print(f"Test accuracy (held-out split): {test_acc:.4f}")
+    if test_acc_tta is not None:
+        print(f"Test accuracy with TTA:         {test_acc_tta:.4f}")
     print(f"Mean epoch time: {mean_epoch_seconds:.1f}s  "
           f"(total training: {total_training_seconds/60:.1f} min)")
     print(f"All artifacts saved in: {run_dir}")

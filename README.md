@@ -118,11 +118,33 @@ python scripts/run_recommended_experiments.py
 
 ## 2. Run all recommended experiments
 
-A single Python driver runs the full Task 2 ablation (six custom-CNN
-runs, 80 epochs each) plus both Task 1 transfer strategies
-(frozen / fine-tune, 15 epochs each). End-to-end wall-clock is
-about 30-35 minutes on an RTX 5880 Ada / RTX 4090, roughly 75
-minutes on an RTX 3090 / A5000, longer on older cards.
+A single Python driver runs the full Task 2 ablation (seven custom-CNN
+runs, 80 epochs each) plus all three Task 1 transfer strategies
+(frozen / fine-tune / fine-tune + EMA, 15 epochs each). Ten runs in
+total. End-to-end wall-clock is about 35-40 minutes on an RTX 5880 Ada
+/ RTX 4090, roughly 85 minutes on an RTX 3090 / A5000, longer on older
+cards.
+
+The last custom-CNN row (`custom_full_ema`) and the last transfer row
+(`transfer_resnet18_finetune_ema`) layer three generic
+stability / test-time techniques on top of the preceding row:
+
+* **EMA** — an exponential moving average of model weights (Polyak
+  averaging, standard in EfficientNet / ConvNeXt / DeiT). The shadow
+  weights are used for validation and are persisted as
+  `best_model.pt`.
+* **`min_lr = 1e-5`** — non-zero floor on the cosine schedule so the
+  last few epochs keep making small but useful updates.
+* **Horizontal-flip TTA** — at the final `--test-at-end` evaluation,
+  predictions are averaged over the image and its left-right flip.
+  Training is untouched. `summary.json` records both the standard
+  `test_acc` and the TTA `test_acc_tta` so the contribution of TTA
+  can be attributed separately in the report.
+
+None of EMA, TTA, or `min_lr` changes the architecture or adds
+pretrained weights, so Task 2's "custom CNN, no pretrained weights"
+constraint and Task 1's "permitted architectures" constraint are
+both respected.
 
 ```bash
 python scripts/run_recommended_experiments.py
@@ -172,7 +194,10 @@ A run named `foo` creates `outputs/foo_<timestamp>/` with:
 | `test_confusion_matrix.png` / csv        | Confusion matrix on the official test split          |
 | `test_classification_report.txt`         | Per-class precision / recall / F1 (test)              |
 | `test_per_class_accuracy.png`            | Per-class accuracy bar chart (test)                   |
-| `summary.json`                           | Best val accuracy, test accuracy, best model path     |
+| `test_tta_confusion_matrix.png` / csv    | TTA confusion matrix (only when `--tta` was used)     |
+| `test_tta_classification_report.txt`     | Per-class report under TTA (only when `--tta` was used) |
+| `test_tta_per_class_accuracy.png`        | Per-class accuracy bar chart under TTA                |
+| `summary.json`                           | Best val accuracy, test accuracy (and TTA test accuracy), best model path |
 
 Test-set artifacts only appear if the run used `--test-at-end`,
 which the recommended driver does for every experiment.
@@ -186,8 +211,8 @@ each headline checkpoint:
 | `outputs/ablation_summary.csv`             | One row per experiment with every headline number   |
 | `outputs/ablation_summary.json`            | Same information in JSON, easier to parse in notebooks |
 | `outputs/ablation_chart.png`               | Grouped bar chart of val / test accuracy across the full sweep |
-| `outputs/custom_full_*/visualisation/`     | Prediction grids + Grad-CAM overlays for the Task 2 best model (val/test × correct/incorrect) |
-| `outputs/transfer_resnet18_finetune_*/visualisation/` | Same four grids for the Task 1 best model |
+| `outputs/custom_full_ema_*/visualisation/`     | Prediction grids + Grad-CAM overlays for the Task 2 best model (val/test × correct/incorrect) |
+| `outputs/transfer_resnet18_finetune_ema_*/visualisation/` | Same four grids for the Task 1 best model |
 
 That is every figure and table the report needs: the confusion
 matrices and training curves come from the individual run folders,
@@ -249,13 +274,25 @@ python -m pet_cw.train \
   --weight-decay 1e-4 --label-smoothing 0.1 --mixup-alpha 0.0 \
   --download --amp --test-at-end
 
-# F. + Mixup (the final, best Task 2 configuration).
+# F. + Mixup.
 python -m pet_cw.train \
   --experiment-name custom_full \
   --model custom --image-size 224 --batch-size 64 --epochs 80 \
   --optimizer adamw --lr 1e-3 --dropout 0.3 \
   --augmentation strong --scheduler cosine --warmup-epochs 3 \
   --weight-decay 1e-4 --label-smoothing 0.1 --mixup-alpha 0.2 \
+  --download --amp --test-at-end
+
+# G. + EMA + cosine min_lr + TTA (the final, best Task 2 configuration).
+#    EMA and min_lr change how training proceeds; TTA applies only at
+#    --test-at-end and reports a second ``test_acc_tta`` number.
+python -m pet_cw.train \
+  --experiment-name custom_full_ema \
+  --model custom --image-size 224 --batch-size 64 --epochs 80 \
+  --optimizer adamw --lr 1e-3 --dropout 0.3 \
+  --augmentation strong --scheduler cosine --warmup-epochs 3 \
+  --weight-decay 1e-4 --label-smoothing 0.1 --mixup-alpha 0.2 \
+  --ema --ema-decay 0.999 --min-lr 1e-5 --tta \
   --download --amp --test-at-end
 ```
 
@@ -286,6 +323,18 @@ python -m pet_cw.train \
   --optimizer adamw --lr 1e-4 --head-lr-mult 10 \
   --weight-decay 1e-4 --scheduler cosine --warmup-epochs 1 \
   --label-smoothing 0.1 \
+  --download --amp --test-at-end
+
+# Fine-tune + EMA + cosine min_lr + TTA (best Task 1 configuration).
+python -m pet_cw.train \
+  --experiment-name transfer_resnet18_finetune_ema \
+  --model resnet18 --pretrained \
+  --image-size 224 --batch-size 32 --epochs 15 \
+  --augmentation basic \
+  --optimizer adamw --lr 1e-4 --head-lr-mult 10 \
+  --weight-decay 1e-4 --scheduler cosine --warmup-epochs 1 \
+  --label-smoothing 0.1 \
+  --ema --ema-decay 0.999 --min-lr 1e-5 --tta \
   --download --amp --test-at-end
 ```
 
@@ -341,15 +390,24 @@ python -m pet_cw.predict \
   test split is only touched once per run at the very end (enabled
   by `--test-at-end`) so a single independent check of the same
   model is also available.
-* The six custom-CNN runs produced by `run_recommended_experiments.py`
-  form a single-variable-at-a-time progression so every increment
-  from baseline to `custom_full` can be attributed to exactly one
-  technique. `baseline → custom_aug` is the augmentation-only
-  ablation the brief explicitly demands in §4; the remaining rows
-  quantify the marginal contribution of LR scheduling, weight
-  decay, label smoothing and Mixup. `transfer_resnet18_frozen`
-  versus `transfer_resnet18_finetune` answers the Lab 6 question
-  about feature extraction versus full fine-tuning on this dataset.
+* The first six custom-CNN runs produced by
+  `run_recommended_experiments.py` (A `custom_baseline` through F
+  `custom_full`) form a single-variable-at-a-time progression so
+  every increment from baseline to `custom_full` can be attributed
+  to exactly one technique. `baseline → custom_aug` is the
+  augmentation-only ablation the brief explicitly demands in §4;
+  the remaining rows quantify the marginal contribution of LR
+  scheduling, weight decay, label smoothing and Mixup. The seventh
+  row, G `custom_full_ema`, layers EMA + cosine `min_lr` + TTA on
+  top of F to measure how much additional headroom those generic
+  training-stability / test-time techniques add once the
+  algorithmic knobs are already tuned. On the transfer side,
+  `transfer_resnet18_frozen` versus `transfer_resnet18_finetune`
+  answers the Lab 6 question about feature extraction versus full
+  fine-tuning; the third transfer row
+  `transfer_resnet18_finetune_ema` adds the same EMA + `min_lr` +
+  TTA package to fine-tuning, giving the strongest legal Task 1
+  configuration.
 * `--seed 42` by default. Pass `--deterministic` for bit-exact
   reruns, at a small throughput cost.
 * `PetResNet` has about 2.7M parameters. The classifier head is a

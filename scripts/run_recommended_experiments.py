@@ -33,18 +33,49 @@ The sweep has two parts:
       the report can attribute every accuracy gain to a specific
       design choice.
 
-2. Task 1 (Transfer Learning) — two runs that answer the Lab 6
-   freeze-vs-fine-tune question on a pretrained ResNet-18:
+   G. ``custom_full_ema``
+      Adds three further, orthogonal-to-training-loss techniques on
+      top of F, all applied together because they act as generic
+      stability / test-time enhancements rather than as algorithmic
+      changes to the learner:
 
-   G. ``transfer_resnet18_frozen``
+        * Exponential Moving Average (EMA) of model weights (Polyak &
+          Juditsky, 1992; standard in EfficientNet, ConvNeXt, DeiT).
+          A shadow copy of the weights is updated after every step
+          and used for validation / checkpointing.
+        * Cosine LR floor ``min_lr = 1e-5`` so the last epochs still
+          make small but useful updates rather than coasting at
+          zero LR.
+        * Horizontal-flip test-time augmentation (TTA) at the final
+          test evaluation only, averaging logits over the image and
+          its left-right flip. Training is unchanged.
+
+      ``summary.json`` records both ``test_acc`` (single forward
+      pass) and ``test_acc_tta`` (flip average), so the report can
+      attribute the TTA contribution separately from EMA. None of
+      these techniques change the architecture, and the model is
+      still trained from scratch on the same data, so the
+      coursework's ''custom CNN, no pretrained weights'' rule for
+      Task 2 is fully respected.
+
+2. Task 1 (Transfer Learning) — three runs covering both the
+   freeze-vs-fine-tune question from Lab 6 and a best-effort
+   configuration for the headline number:
+
+   H. ``transfer_resnet18_frozen``
       Feature-extraction strategy. Backbone frozen, only the 37-way
       classifier head trains. Cheap; gives a lower bound on what
       pretrained features already know about pets.
 
-   H. ``transfer_resnet18_finetune``
+   I. ``transfer_resnet18_finetune``
       Full fine-tuning with a differential learning rate: head LR is
-      10x the backbone LR. Typically the strongest configuration
-      once enough labelled data is available.
+      10x the backbone LR. The standard strong baseline.
+
+   J. ``transfer_resnet18_finetune_ema``
+      Same configuration as I but with EMA + ``min_lr = 1e-5`` + TTA
+      at the final test evaluation. Gives the best Task 1 number
+      while still using a permitted architecture (ResNet-18, listed
+      explicitly in the brief's ''Permitted Architectures'').
 
 Defaults are 80 epochs for each Task 2 (custom CNN) run and 15 for
 each Task 1 (transfer learning) run. The brief's "e.g. 10–30
@@ -302,6 +333,29 @@ def build_experiments(
                 "--mixup-alpha", "0.2",
             ],
         },
+        {
+            # Same knobs as ``custom_full`` plus EMA, a non-zero
+            # cosine floor (min_lr = 1e-5), and horizontal-flip TTA.
+            # All three are orthogonal training-stability / test-time
+            # techniques; none of them add architectural capacity or
+            # touch the data pipeline, so the coursework's custom-CNN
+            # rule is unaffected.
+            "name": "custom_full_ema",
+            "args": [
+                "--experiment-name", "custom_full_ema",
+                *common_custom,
+                "--augmentation", "strong",
+                "--scheduler", "cosine",
+                "--warmup-epochs", "3",
+                "--weight-decay", "1e-4",
+                "--label-smoothing", "0.1",
+                "--mixup-alpha", "0.2",
+                "--ema",
+                "--ema-decay", "0.999",
+                "--min-lr", "1e-5",
+                "--tta",
+            ],
+        },
         # ---- Task 1: freeze vs fine-tune on ResNet-18 ----
         {
             "name": "transfer_resnet18_frozen",
@@ -323,6 +377,25 @@ def build_experiments(
                 *common_transfer,
                 "--lr", "1e-4",
                 "--head-lr-mult", "10",
+            ],
+        },
+        {
+            # EMA + min_lr + TTA layered onto the fine-tune recipe.
+            # ResNet-18 is explicitly allowed by the brief's permitted
+            # architectures list; EMA and TTA are standard techniques
+            # (no external weights or data).
+            "name": "transfer_resnet18_finetune_ema",
+            "args": [
+                "--experiment-name", "transfer_resnet18_finetune_ema",
+                "--model", "resnet18",
+                "--pretrained",
+                *common_transfer,
+                "--lr", "1e-4",
+                "--head-lr-mult", "10",
+                "--ema",
+                "--ema-decay", "0.999",
+                "--min-lr", "1e-5",
+                "--tta",
             ],
         },
     ]
@@ -401,14 +474,17 @@ def find_latest_run_dir(output_dir: Path, experiment_name: str) -> Path | None:
 VIS_MODULE = "pet_cw.visualize"
 
 # Which experiment names should get Grad-CAM / prediction grids written
-# at the end of the sweep. Task 2 best is ``custom_full``, Task 1 best is
-# the fine-tuned ResNet-18. Frozen ResNet-18 is skipped on purpose: it
-# shares the same backbone weights as the fine-tuned version minus the
-# head, so its Grad-CAM figures would not add new information to the
-# report.
+# at the end of the sweep. Task 2 best is ``custom_full_ema``, Task 1
+# best is the fine-tuned ResNet-18 with EMA. Frozen ResNet-18 is skipped
+# on purpose: it shares the same backbone weights as the fine-tuned
+# version minus the head, so its Grad-CAM figures would not add new
+# information to the report. The non-EMA runs (``custom_full``,
+# ``transfer_resnet18_finetune``) are also skipped because they are the
+# ablation predecessors of the EMA runs and would show visually similar
+# focus patterns.
 VISUALISATION_TARGETS = (
-    "custom_full",
-    "transfer_resnet18_finetune",
+    "custom_full_ema",
+    "transfer_resnet18_finetune_ema",
 )
 
 # Each target produces one grid per (split, filter) combination so the
@@ -491,15 +567,32 @@ def plot_ablation_chart(rows: list[dict], output_dir: Path) -> Path | None:
     names = [row["experiment_name"] for row in ordered]
     val_accs = [float(row.get("best_val_acc") or 0.0) * 100.0 for row in ordered]
     test_accs = [float(row.get("test_acc") or 0.0) * 100.0 for row in ordered]
+    # Only draw the TTA bars if at least one row actually has a TTA
+    # number; otherwise the chart stays as a clean two-bar layout
+    # for the earlier single-pass runs.
+    tta_accs = [float(row.get("test_acc_tta") or 0.0) * 100.0 for row in ordered]
+    has_tta = any(value > 0.0 for value in tta_accs)
 
     import numpy as np  # local import to match the matplotlib pattern above
 
     x = np.arange(len(names))
-    width = 0.38
+    width = 0.26 if has_tta else 0.38
 
-    fig, ax = plt.subplots(figsize=(max(8.0, 1.25 * len(names)), 5.0))
-    bars_val = ax.bar(x - width / 2, val_accs, width, label="Validation accuracy", color="#3b7dd8")
-    bars_test = ax.bar(x + width / 2, test_accs, width, label="Test accuracy", color="#d86b3b")
+    fig, ax = plt.subplots(figsize=(max(9.0, 1.4 * len(names)), 5.2))
+    if has_tta:
+        bars_val = ax.bar(x - width, val_accs, width,
+                          label="Validation accuracy", color="#3b7dd8")
+        bars_test = ax.bar(x, test_accs, width,
+                           label="Test accuracy", color="#d86b3b")
+        bars_tta = ax.bar(x + width, tta_accs, width,
+                          label="Test accuracy (TTA)", color="#2ca06c")
+        bar_groups = (bars_val, bars_test, bars_tta)
+    else:
+        bars_val = ax.bar(x - width / 2, val_accs, width,
+                          label="Validation accuracy", color="#3b7dd8")
+        bars_test = ax.bar(x + width / 2, test_accs, width,
+                           label="Test accuracy", color="#d86b3b")
+        bar_groups = (bars_val, bars_test)
 
     ax.set_ylabel("Accuracy (%)")
     ax.set_title("COMP3065 ablation: validation vs held-out test accuracy")
@@ -510,10 +603,14 @@ def plot_ablation_chart(rows: list[dict], output_dir: Path) -> Path | None:
     ax.legend(loc="upper left")
 
     # Annotate each bar with its numeric value to save the report writer
-    # having to squint at the axis.
-    for bar_group in (bars_val, bars_test):
+    # having to squint at the axis. Zero-height TTA bars (which only
+    # exist for rows that never ran TTA) are skipped to avoid stacking
+    # ''0.0'' labels on top of the other bars.
+    for bar_group in bar_groups:
         for bar in bar_group:
             height = bar.get_height()
+            if height <= 0.0:
+                continue
             ax.annotate(
                 f"{height:.1f}",
                 xy=(bar.get_x() + bar.get_width() / 2, height),

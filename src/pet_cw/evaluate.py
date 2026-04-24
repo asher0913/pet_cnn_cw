@@ -22,7 +22,7 @@ from torch import nn
 
 from pet_cw.data import build_dataloaders
 from pet_cw.models import build_model
-from pet_cw.train import run_one_epoch
+from pet_cw.train import run_one_epoch, run_tta_evaluation
 from pet_cw.utils import (
     get_device,
     save_confusion_outputs,
@@ -47,6 +47,10 @@ def parse_args() -> argparse.Namespace:
                         help="Download the dataset if it is missing.")
     parser.add_argument("--skip-test", action="store_true",
                         help="Only re-score the validation split.")
+    parser.add_argument("--tta", action="store_true",
+                        help="Also evaluate the test split with horizontal-flip TTA "
+                             "(averages logits over original + flipped). Recorded as "
+                             "test_acc_tta alongside the plain test_acc.")
     return parser.parse_args()
 
 
@@ -128,6 +132,7 @@ def main() -> None:
     }
 
     # --- Test ---
+    test_acc_tta: float | None = None
     if not args.skip_test:
         with torch.no_grad():
             test_loss, test_acc, test_targets, test_predictions = run_one_epoch(
@@ -146,11 +151,28 @@ def main() -> None:
             "test_samples": len(test_targets),
         })
 
+        if args.tta:
+            tta_loss, test_acc_tta, tta_targets, tta_predictions = run_tta_evaluation(
+                model=model, loader=data.test_loader,
+                criterion=criterion,
+                device=device, use_amp=False,
+            )
+            save_confusion_outputs(output_dir, tta_targets, tta_predictions,
+                                   checkpoint["class_names"], prefix="test_tta")
+            save_per_class_accuracy_bar(output_dir, tta_targets, tta_predictions,
+                                        checkpoint["class_names"], prefix="test_tta")
+            results.update({
+                "test_loss_tta": float(tta_loss),
+                "test_acc_tta": float(test_acc_tta),
+            })
+
     save_json(output_dir / "metrics.json", results)
 
     print(f"Validation loss / acc: {val_loss:.4f} / {val_acc:.4f}")
     if not args.skip_test:
         print(f"Test loss / acc:       {test_loss:.4f} / {test_acc:.4f}")
+    if test_acc_tta is not None:
+        print(f"Test (TTA) loss / acc: {tta_loss:.4f} / {test_acc_tta:.4f}")
     print(f"Evaluation artifacts in: {output_dir}")
 
 
